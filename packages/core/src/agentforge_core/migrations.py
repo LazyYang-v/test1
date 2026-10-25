@@ -121,6 +121,11 @@ async def apply_migrations(
                 f"SELECT version, name, checksum FROM {VERSION_TABLE}"
             )
         }
+        for version in range(1, max(applied, default=0) + 1):
+            if version not in applied:
+                raise MigrationError(
+                    f"migration ledger is not contiguous: missing version {version:04d}"
+                )
         migration_by_version = {
             version: (name, path) for version, name, path in migrations
         }
@@ -140,6 +145,14 @@ async def apply_migrations(
             if applied_checksum != checksum:
                 raise MigrationError(
                     f"migration {name} checksum mismatch: file changed after it was applied"
+                )
+
+        if migrations and migrations[0][0] == 0:
+            raise MigrationError("migration files must start at version 0001")
+        for version in range(1, max(migration_by_version, default=0) + 1):
+            if version not in migration_by_version:
+                raise MigrationError(
+                    f"migration files are not contiguous: missing version {version:04d}"
                 )
 
         newly: list[int] = []
