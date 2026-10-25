@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import asyncpg
@@ -59,9 +60,10 @@ async def test_business_ro_queries_frozen_gmv_and_has_view_only_read_access(
         assert east_totals["positive_period"] == 56000
         assert east_totals["decline_baseline"] == 70000
         assert east_totals["decline_current"] == 57400
-        assert (
+        change_rate = (
             east_totals["decline_current"] - east_totals["decline_baseline"]
-        ) / east_totals["decline_baseline"] == pytest.approx(-0.18)
+        ) / east_totals["decline_baseline"]
+        assert change_rate == Decimal("-0.18")
 
         local_day = await business_ro.fetchval(
             """
@@ -73,7 +75,7 @@ async def test_business_ro_queries_frozen_gmv_and_has_view_only_read_access(
               AND paid_amount IN (12.34, 23.45)
             """
         )
-        assert local_day == 12.34
+        assert local_day == Decimal("12.34")
 
         next_local_day = await business_ro.fetchval(
             """
@@ -85,7 +87,7 @@ async def test_business_ro_queries_frozen_gmv_and_has_view_only_read_access(
               AND paid_amount IN (12.34, 23.45)
             """
         )
-        assert next_local_day == 23.45
+        assert next_local_day == Decimal("23.45")
 
         has_privileges = await business_ro.fetchrow(
             """

@@ -78,4 +78,10 @@ def test_dataset_generation_is_byte_identical_and_snapshot_id_is_sha256(tmp_path
         "seed": 20261026,
         "sort_order": "order_no,record_type",
     }
-    assert sum(record["record_type"] == "order" for record in records) == DATASET_ORDER_COUNT
+    orders = [record for record in records if record["record_type"] == "order"]
+    assert len(orders) == DATASET_ORDER_COUNT
+    assert sum(order["status"] == "refunded" for order in orders) == 3_240
+    assert {
+        region: sum(order["region_code"] == region for order in orders)
+        for region in {order["region_code"] for order in orders}
+    } == {"CN_EAST": 36_000, "CN_NORTH": 36_000, "CN_SOUTH": 36_000}
