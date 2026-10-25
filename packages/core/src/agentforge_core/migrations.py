@@ -6,6 +6,7 @@ Shared by the ``agentforge-migrate`` CLI and the API readiness check.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -84,32 +85,83 @@ async def apply_migrations(
 
     conn = await asyncpg.connect(dsn)
     try:
+        await conn.execute(
+            "SELECT pg_advisory_lock(hashtext('agentforge_migrate'))"
+        )
         await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {VERSION_TABLE_SCHEMA}")
         await conn.execute(
             f"CREATE TABLE IF NOT EXISTS {VERSION_TABLE} ("
             "version INTEGER PRIMARY KEY, "
             "name TEXT NOT NULL, "
+            "checksum TEXT NOT NULL, "
             "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
+        columns = await conn.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = $2",
+            VERSION_TABLE_SCHEMA,
+            "schema_migrations",
+        )
+        has_checksum = "checksum" in {row["column_name"] for row in columns}
+        rows = await conn.fetch(f"SELECT version, name FROM {VERSION_TABLE}")
+        if rows and not has_checksum:
+            raise MigrationError(
+                "migration ledger has applied rows without checksums; refusing to "
+                "backfill from current files. Manually verify and reconcile all "
+                "previously applied migrations before recreating the ledger"
+            )
+        if not has_checksum:
+            await conn.execute(
+                f"ALTER TABLE {VERSION_TABLE} ADD COLUMN checksum "
+                "TEXT NOT NULL DEFAULT ''"
+            )
         applied = {
-            int(row["version"])
-            for row in await conn.fetch(f"SELECT version FROM {VERSION_TABLE}")
+            int(row["version"]): (row["name"], row["checksum"])
+            for row in await conn.fetch(
+                f"SELECT version, name, checksum FROM {VERSION_TABLE}"
+            )
         }
+        migration_by_version = {
+            version: (name, path) for version, name, path in migrations
+        }
+        for version, (applied_name, applied_checksum) in applied.items():
+            migration = migration_by_version.get(version)
+            if migration is None:
+                raise MigrationError(
+                    f"applied migration {version:04d} ({applied_name}) no longer exists"
+                )
+            name, path = migration
+            if applied_name != name:
+                raise MigrationError(
+                    f"migration {version:04d} filename mismatch: ledger records "
+                    f"{applied_name}, current file is {name}"
+                )
+            checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+            if applied_checksum != checksum:
+                raise MigrationError(
+                    f"migration {name} checksum mismatch: file changed after it was applied"
+                )
+
         newly: list[int] = []
         for version, name, path in migrations:
             if version in applied:
                 continue
-            sql = substitute_env(path.read_text(encoding="utf-8"), env)
+            source = path.read_bytes()
+            checksum = hashlib.sha256(source).hexdigest()
+            sql = substitute_env(source.decode("utf-8"), env)
             async with conn.transaction():
                 await conn.execute(sql)
                 await conn.execute(
-                    f"INSERT INTO {VERSION_TABLE} (version, name) VALUES ($1, $2)",
+                    f"INSERT INTO {VERSION_TABLE} (version, name, checksum) "
+                    "VALUES ($1, $2, $3)",
                     version,
                     name,
+                    checksum,
                 )
             newly.append(version)
         return newly
     finally:
+        # Closing the session releases its advisory lock on success and failure.
         await conn.close()
 
 
