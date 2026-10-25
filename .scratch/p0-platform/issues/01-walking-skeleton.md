@@ -4,10 +4,14 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `docker compose up` 冷启动后 `/health/live` 返回 200
-- [ ] 迁移未执行或版本不匹配时 `/health/ready` 拒绝就绪；迁移完成后返回 200
-- [ ] 迁移 0001 创建全部 Schema 与五个数据库角色（migrator/api/worker/business_ro/eval），可重复执行不报错
-- [ ] Integration 测试对真实 PostgreSQL 运行并在结束后清理状态
-- [ ] API 服务使用非超级用户数据库角色；不自动执行破坏性迁移
+- [x] `docker compose up` 冷启动后 `/health/live` 返回 200
+- [x] 迁移未执行或版本不匹配时 `/health/ready` 拒绝就绪；迁移完成后返回 200
+- [x] 迁移 0001 创建全部 Schema 与五个数据库角色（migrator/api/worker/business_ro/eval），可重复执行不报错
+- [x] Integration 测试对真实 PostgreSQL 运行并在结束后清理状态
+- [x] API 服务使用非超级用户数据库角色；不自动执行破坏性迁移
+
+**Resolution:** Merged into `integration/p0` at `9ead0903b24e4315f4a5f352e9f8e88919480aec`.
+
+**Verification:** Offline 13 passed; Integration 7 passed against PostgreSQL 17; cold-start passed with API running as uid 10001 and `agentforge_api` (`rolsuper=false`).
