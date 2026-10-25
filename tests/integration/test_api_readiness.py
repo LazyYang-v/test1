@@ -19,8 +19,22 @@ async def _get_ready(dsn: str):
         return await client.get("/health/ready")
 
 
-async def test_ready_refuses_database_without_migration(unmigrated_db):
-    response = await _get_ready(unmigrated_db["superuser_dsn"])
+async def test_ready_refuses_database_without_migration(unmigrated_db, migrated_db):
+    # The API role exists on the cluster after the baseline migration, so grant
+    # it access to the empty ledger in this separate, fresh database.
+    conn = await asyncpg.connect(unmigrated_db["superuser_dsn"])
+    try:
+        await conn.execute(
+            "CREATE SCHEMA agentforge; "
+            "CREATE TABLE agentforge.schema_migrations "
+            "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, "
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now()); "
+            "GRANT USAGE ON SCHEMA agentforge TO agentforge_api; "
+            "GRANT SELECT ON agentforge.schema_migrations TO agentforge_api"
+        )
+    finally:
+        await conn.close()
+    response = await _get_ready(unmigrated_db["role_dsn"]("api"))
 
     assert response.status_code == 503
     assert response.json()["reason"] == "not_migrated"
@@ -31,14 +45,14 @@ async def test_ready_requires_exact_migration_version(migrated_db):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 1,
-        "applied_schema_version": 1,
+        "expected_schema_version": 2,
+        "applied_schema_version": 2,
     }
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
-            "UPDATE agentforge.schema_migrations SET version = 2 WHERE version = 1"
+            "UPDATE agentforge.schema_migrations SET version = 3 WHERE version = 2"
         )
     finally:
         await conn.close()

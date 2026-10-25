@@ -243,14 +243,18 @@ def migrated_db(postgres_server, migrated_template_db):
 
 @pytest.fixture
 def unmigrated_db(postgres_server):
-    """A fresh database that no migration has ever touched."""
+    """A fresh database that has never had a migration applied."""
     name = f"agentforge_it_{uuid.uuid4().hex[:8]}"
-    _create_database(postgres_server, name, owner="postgres")
+    _create_database(postgres_server, name, owner="agentforge_migrator")
     try:
         yield {
             "name": name,
             "server": postgres_server,
             "superuser_dsn": f"{postgres_server['superuser_dsn_prefix']}/{name}",
+            "role_dsn": lambda role: (
+                f"postgresql://{ROLE_USERS[role]}:{ROLE_PASSWORDS[role]}"
+                f"@{postgres_server['host']}/{name}"
+            ),
         }
     finally:
         _drop_database(postgres_server, name)
