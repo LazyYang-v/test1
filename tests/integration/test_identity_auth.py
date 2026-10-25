@@ -174,6 +174,43 @@ async def test_missing_expired_and_stale_credentials_are_uniformly_rejected(migr
     )
 
 
+async def test_invalid_request_and_missing_route_use_uniform_error_envelope(migrated_db):
+    app = _app(migrated_db)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        invalid = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "alice@example.com"},
+            headers={"X-Request-ID": "invalid-body-request"},
+        )
+        missing = await client.get(
+            "/api/v1/no-such-route",
+            headers={"X-Request-ID": "missing-route-request"},
+        )
+
+    assert invalid.status_code == 400
+    assert invalid.json() == {
+        "error": {
+            "code": "INVALID_REQUEST",
+            "message": "The request is invalid",
+            "retryable": False,
+            "details": {"fields": ["body.password"]},
+        },
+        "request_id": "invalid-body-request",
+    }
+    assert missing.status_code == 404
+    assert missing.json() == {
+        "error": {
+            "code": "NOT_FOUND",
+            "message": "The requested resource was not found",
+            "retryable": False,
+            "details": {},
+        },
+        "request_id": "missing-route-request",
+    }
+
+
 async def test_current_user_lists_only_active_region_grants(migrated_db):
     user_id = await _create_user(migrated_db)
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))

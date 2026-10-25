@@ -9,6 +9,7 @@ from typing import Any
 import asyncpg
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -138,6 +139,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(ApiError)
     async def handle_api_error(request: Request, error: ApiError) -> JSONResponse:
         return _error_response(request, error)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(
+        request: Request, error: StarletteHTTPException
+    ) -> JSONResponse:
+        if error.status_code == 404:
+            api_error = ApiError(
+                404,
+                "NOT_FOUND",
+                "The requested resource was not found",
+            )
+        elif error.status_code == 405:
+            api_error = ApiError(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "The request method is not allowed",
+            )
+        else:
+            api_error = ApiError(
+                error.status_code,
+                "HTTP_ERROR",
+                "The request could not be completed",
+            )
+        return _error_response(request, api_error)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
