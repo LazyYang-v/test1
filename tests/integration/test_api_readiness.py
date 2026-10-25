@@ -20,7 +20,7 @@ async def _get_ready(dsn: str):
 
 
 async def test_ready_refuses_database_without_migration(unmigrated_db):
-    response = await _get_ready(unmigrated_db["superuser_dsn"])
+    response = await _get_ready(unmigrated_db["role_dsn"]("api"))
 
     assert response.status_code == 503
     assert response.json()["reason"] == "not_migrated"
@@ -31,14 +31,14 @@ async def test_ready_requires_exact_migration_version(migrated_db):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 1,
-        "applied_schema_version": 1,
+        "expected_schema_version": 2,
+        "applied_schema_version": 2,
     }
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
-            "UPDATE agentforge.schema_migrations SET version = 2 WHERE version = 1"
+            "UPDATE agentforge.schema_migrations SET version = 3 WHERE version = 2"
         )
     finally:
         await conn.close()
