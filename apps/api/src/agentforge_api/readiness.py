@@ -8,7 +8,7 @@ from typing import Any
 
 import asyncpg
 
-from agentforge_core.migrations import fetch_applied_version
+from agentforge_core.migrations import MigrationLedgerError, fetch_applied_version
 from agentforge_core.schema_version import SCHEMA_VERSION, evaluate_readiness
 
 CONNECT_TIMEOUT_SECONDS = 5.0
@@ -32,6 +32,8 @@ async def check_database_readiness(dsn: str) -> dict[str, Any]:
             applied = await fetch_applied_version(conn)
         except asyncpg.UndefinedTableError:
             return {**unavailable, "reason": "not_migrated"}
+        except MigrationLedgerError:
+            return {**unavailable, "reason": "version_mismatch"}
         except asyncpg.PostgresError:
             return {**unavailable, "reason": "db_error"}
     finally:

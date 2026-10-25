@@ -37,6 +37,16 @@ class DatasetError(ValueError):
     """Raised when dataset bytes or records do not match the frozen contract."""
 
 
+def _expected_manifest() -> dict[str, Any]:
+    return {
+        "canonicalization": CANONICALIZATION,
+        "generator_version": GENERATOR_VERSION,
+        "record_type": "dataset",
+        "seed": DATASET_SEED,
+        "sort_order": SORT_ORDER,
+    }
+
+
 def _inspect(path: Path) -> tuple[str, dict[str, Any]]:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -50,14 +60,7 @@ def _inspect(path: Path) -> tuple[str, dict[str, Any]]:
         manifest = json.loads(first)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DatasetError("dataset manifest is not valid UTF-8 JSON") from error
-    expected = {
-        "canonicalization": CANONICALIZATION,
-        "generator_version": GENERATOR_VERSION,
-        "record_type": "dataset",
-        "seed": DATASET_SEED,
-        "sort_order": SORT_ORDER,
-    }
-    if manifest != expected:
+    if manifest != _expected_manifest():
         raise DatasetError("dataset manifest does not match the frozen generator contract")
     return snapshot_id, manifest
 
@@ -124,13 +127,6 @@ async def load_dataset(conn: asyncpg.Connection, dataset_path: str | Path) -> st
     ):
         raise DatasetError("registered snapshot metadata does not match generated dataset")
 
-    present = await conn.fetchval(
-        "SELECT EXISTS (SELECT FROM business.orders WHERE data_snapshot_id = $1)",
-        snapshot_id,
-    )
-    if present:
-        return snapshot_id
-
     order_batch: list[tuple[Any, ...]] = []
     item_batch: list[tuple[Any, ...]] = []
     order_count = 0
@@ -147,10 +143,39 @@ async def load_dataset(conn: asyncpg.Connection, dataset_path: str | Path) -> st
     )
 
     async with conn.transaction():
-        with path.open("r", encoding="utf-8") as source:
-            next(source)
-            for line_number, line in enumerate(source, start=2):
+        load_state = await conn.fetchrow(
+            """
+            SELECT status FROM business.dataset_loads
+            WHERE data_snapshot_id = $1
+            FOR UPDATE
+            """,
+            snapshot_id,
+        )
+        if load_state is None:
+            raise DatasetError("dataset snapshot has no load state")
+        if load_state["status"] == "complete":
+            return snapshot_id
+        await conn.execute(
+            "UPDATE business.dataset_loads SET status = 'loading' "
+            "WHERE data_snapshot_id = $1",
+            snapshot_id,
+        )
+
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            first_line = source.readline()
+            digest.update(first_line)
+            try:
+                loaded_manifest = json.loads(first_line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise DatasetError("dataset manifest is not valid UTF-8 JSON") from error
+            if loaded_manifest != _expected_manifest():
+                raise DatasetError("dataset manifest changed after snapshot inspection")
+
+            for line_number, raw_line in enumerate(source, start=2):
+                digest.update(raw_line)
                 try:
+                    line = raw_line.decode("utf-8")
                     record = json.loads(line)
                     record_type = record.pop("record_type")
                     if record_type == "order":
@@ -161,7 +186,14 @@ async def load_dataset(conn: asyncpg.Connection, dataset_path: str | Path) -> st
                         item_count += 1
                     else:
                         raise DatasetError(f"unknown record_type {record_type!r}")
-                except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    ArithmeticError,
+                ) as error:
                     raise DatasetError(f"invalid dataset record on line {line_number}") from error
 
                 if len(order_batch) >= _BATCH_SIZE:
@@ -180,6 +212,14 @@ async def load_dataset(conn: asyncpg.Connection, dataset_path: str | Path) -> st
                 f"expected {DATASET_ORDER_COUNT} orders and items, "
                 f"found {order_count} orders and {item_count} items"
             )
+        if digest.hexdigest() != snapshot_id:
+            raise DatasetError("dataset content hash changed during load")
+        await conn.execute(
+            "UPDATE business.dataset_loads "
+            "SET status = 'complete', completed_at = now() "
+            "WHERE data_snapshot_id = $1",
+            snapshot_id,
+        )
 
     return snapshot_id
 

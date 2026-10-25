@@ -22,6 +22,10 @@ class MigrationError(RuntimeError):
     """Raised when a migration file or its environment is invalid."""
 
 
+class MigrationLedgerError(MigrationError):
+    """Raised when the applied migration ledger is not contiguous."""
+
+
 _ENV_TOKEN = re.compile(r"\{\{env:([A-Za-z_][A-Za-z0-9_]*)\}\}")
 _FILENAME = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
@@ -61,15 +65,20 @@ def _discover(versions_dir: Path) -> list[tuple[int, str, Path]]:
 
 
 async def fetch_applied_version(conn: asyncpg.Connection) -> int | None:
-    """Return the highest applied migration version, or None if none applied.
+    """Return the highest contiguous applied version, or None if none applied.
 
-    Raises asyncpg's UndefinedSchemaError/UndefinedTableError when migrations
-    have never run — the readiness check maps that to "not_migrated".
+    A gapped ledger is not a valid applied version. Raises asyncpg's
+    UndefinedSchemaError/UndefinedTableError when migrations have never run —
+    the readiness check maps that to "not_migrated".
     """
-    row = await conn.fetchrow(f"SELECT MAX(version) AS version FROM {VERSION_TABLE}")
-    if row is None or row["version"] is None:
+    versions = await conn.fetch(f"SELECT version FROM {VERSION_TABLE} ORDER BY version")
+    if not versions:
         return None
-    return int(row["version"])
+    actual = [int(row["version"]) for row in versions]
+    expected = list(range(1, actual[-1] + 1))
+    if actual != expected:
+        raise MigrationLedgerError("migration ledger is not contiguous")
+    return actual[-1]
 
 
 async def apply_migrations(
