@@ -7,10 +7,11 @@
 -- No extensions are required: primary keys are app-side UUIDv7 and hashing
 -- is app-side, both per the design baseline field conventions.
 --
--- agentforge_migrator normally pre-exists (bootstrapped by the runner's
--- bootstrap step, which needs cluster privileges once); its guard block is
--- kept here so this file is the single source of truth for all five roles.
--- Passwords come from the environment via {{env:NAME}} tokens substituted
+-- agentforge_migrator normally pre-exists (bootstrapped once by the PostgreSQL
+-- init script); its guard block is kept here so this file is the single source
+-- of truth for all five roles. The migrator's CREATEROLE privilege is required
+-- to create the other four login roles in this migration.
+-- Passwords come from the environment via env-substitution tokens resolved
 -- by the runner at apply time; they are never stored in this repository.
 
 CREATE SCHEMA IF NOT EXISTS identity;

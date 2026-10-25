@@ -30,7 +30,7 @@ async def check_database_readiness(dsn: str) -> dict[str, Any]:
     try:
         try:
             applied = await fetch_applied_version(conn)
-        except (asyncpg.UndefinedSchemaError, asyncpg.UndefinedTableError):
+        except asyncpg.UndefinedTableError:
             return {**unavailable, "reason": "not_migrated"}
         except asyncpg.PostgresError:
             return {**unavailable, "reason": "db_error"}
