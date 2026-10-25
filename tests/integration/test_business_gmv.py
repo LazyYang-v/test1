@@ -2,19 +2,67 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from decimal import Decimal
 from pathlib import Path
 
 import asyncpg
 import pytest
 
+from agentforge_core import business_loader
 from agentforge_core.business_dataset import write_dataset
-from agentforge_core.business_loader import load_dataset
+from agentforge_core.business_loader import DatasetError, load_dataset
 
 pytestmark = pytest.mark.integration
 
 
-async def test_business_ro_queries_frozen_gmv_and_has_view_only_read_access(
+async def test_changed_dataset_bytes_roll_back_all_loaded_rows(
+    migrated_db, tmp_path: Path, monkeypatch
+):
+    dataset_path = tmp_path / "business.jsonl"
+    snapshot_id = write_dataset(dataset_path)
+    inspect = business_loader._inspect
+
+    def inspect_then_change(path: Path):
+        inspected_snapshot, manifest = inspect(path)
+        loop = asyncio.get_running_loop()
+
+        def replace_after_inspection():
+            records = dataset_path.read_text(encoding="utf-8").splitlines()
+            record = json.loads(records[1])
+            record["region_code"] = (
+                "CN_NORTH" if record["region_code"] != "CN_NORTH" else "CN_EAST"
+            )
+            records[1] = json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            dataset_path.write_text("\n".join(records) + "\n", encoding="utf-8")
+
+        loop.call_soon(replace_after_inspection)
+        return inspected_snapshot, manifest
+
+    monkeypatch.setattr(business_loader, "_inspect", inspect_then_change)
+    migrator = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
+    try:
+        with pytest.raises(DatasetError, match="hash"):
+            await load_dataset(migrator, dataset_path)
+        counts = await migrator.fetchrow(
+            """
+            SELECT
+                (SELECT count(*) FROM business.orders WHERE data_snapshot_id = $1) AS orders,
+                (SELECT count(*) FROM business.order_items oi
+                 JOIN business.orders o ON o.id = oi.order_id
+                 WHERE o.data_snapshot_id = $1) AS items
+            """,
+            snapshot_id,
+        )
+        assert dict(counts) == {"orders": 0, "items": 0}
+    finally:
+        await migrator.close()
+
+
+async def test_loaded_business_snapshot_is_immutable_and_business_ro_queries_frozen_gmv(
     migrated_db, tmp_path: Path
 ):
     dataset_path = tmp_path / "business.jsonl"
@@ -22,6 +70,54 @@ async def test_business_ro_queries_frozen_gmv_and_has_view_only_read_access(
     migrator = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await load_dataset(migrator, dataset_path)
+        assert await load_dataset(migrator, dataset_path) == snapshot_id
+        with pytest.raises(asyncpg.PostgresError, match="cannot be reset"):
+            await migrator.execute(
+                "UPDATE business.dataset_loads SET status = 'loading' "
+                "WHERE data_snapshot_id = $1",
+                snapshot_id,
+            )
+        mutation_statements = (
+            (
+                """
+                INSERT INTO business.orders (
+                    id, order_no, data_snapshot_id, region_code, customer_id, ordered_at,
+                    status, gross_amount, discount_amount, paid_amount, currency, paid_at,
+                    created_at
+                )
+                SELECT gen_random_uuid(), order_no || '-EXTRA', data_snapshot_id,
+                       region_code, customer_id, ordered_at, status, gross_amount,
+                       discount_amount, paid_amount, currency, paid_at, created_at
+                FROM business.orders LIMIT 1
+                """,
+                (),
+            ),
+            (
+                "UPDATE business.orders SET region_code = region_code WHERE data_snapshot_id = $1",
+                (snapshot_id,),
+            ),
+            (
+                "DELETE FROM business.orders WHERE data_snapshot_id = $1",
+                (snapshot_id,),
+            ),
+            (
+                """
+                INSERT INTO business.order_items (
+                    id, order_id, sku_id, category_code, quantity, unit_price,
+                    discount_amount, paid_amount
+                )
+                SELECT gen_random_uuid(), order_id, sku_id || '-EXTRA', category_code,
+                       quantity, unit_price, discount_amount, paid_amount
+                FROM business.order_items LIMIT 1
+                """,
+                (),
+            ),
+            ("UPDATE business.order_items SET sku_id = sku_id WHERE true", ()),
+            ("DELETE FROM business.order_items WHERE true", ()),
+        )
+        for statement, arguments in mutation_statements:
+            with pytest.raises(asyncpg.PostgresError, match="frozen|immutable"):
+                await migrator.execute(statement, *arguments)
     finally:
         await migrator.close()
 

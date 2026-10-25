@@ -190,7 +190,7 @@ async def test_raw_reexecution_after_clearing_bookkeeping_succeeds(migrated_db):
     applied = await apply_migrations(
         migrated_db["role_dsn"]("migrator"), VERSIONS_DIR, migrated_db["migrate_env"]
     )
-    assert applied == [1, 2, 3]
+    assert applied == [1, 2, 3, 4, 5]
 
     conn = await _connect(migrated_db["role_dsn"]("migrator"))
     try:
@@ -203,7 +203,7 @@ async def test_raw_reexecution_after_clearing_bookkeeping_succeeds(migrated_db):
         )
     finally:
         await conn.close()
-    assert version == 3
+    assert version == 5
     assert schema_count == len(EXPECTED_SCHEMAS)
 
 
@@ -289,7 +289,7 @@ async def test_api_role_reads_version_table_but_cannot_create_tables(migrated_db
         version = await conn.fetchval(
             "SELECT MAX(version) FROM agentforge.schema_migrations"
         )
-        assert version == 3
+        assert version == 5
 
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute("CREATE TABLE identity.forbidden (id INTEGER)")

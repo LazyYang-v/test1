@@ -40,19 +40,32 @@ async def test_ready_refuses_database_without_migration(unmigrated_db, migrated_
     assert response.json()["reason"] == "not_migrated"
 
 
+async def test_ready_rejects_gapped_migration_ledger(migrated_db):
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
+    try:
+        await conn.execute("DELETE FROM agentforge.schema_migrations WHERE version = 2")
+    finally:
+        await conn.close()
+
+    response = await _get_ready(migrated_db["role_dsn"]("api"))
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "version_mismatch"
+
+
 async def test_ready_requires_exact_migration_version(migrated_db):
     response = await _get_ready(migrated_db["role_dsn"]("api"))
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 3,
-        "applied_schema_version": 3,
+        "expected_schema_version": 5,
+        "applied_schema_version": 5,
     }
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
-            "UPDATE agentforge.schema_migrations SET version = 4 WHERE version = 3"
+            "UPDATE agentforge.schema_migrations SET version = 6 WHERE version = 5"
         )
     finally:
         await conn.close()
