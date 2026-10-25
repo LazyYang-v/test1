@@ -1,16 +1,187 @@
 """FastAPI application factory for the AgentForge control plane."""
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from __future__ import annotations
 
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+
+import asyncpg
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from agentforge_api.auth import (
+    ApiError,
+    create_access_token,
+    current_principal,
+    log_auth_failure,
+    verify_password,
+)
 from agentforge_api.config import Settings
 from agentforge_api.readiness import check_database_readiness
+
+
+@asynccontextmanager
+async def _database_connection(dsn: str):
+    conn = await asyncpg.connect(dsn)
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+async def require_region_grant(
+    conn: asyncpg.Connection,
+    *,
+    principal_id: str,
+    region_code: str,
+    permission: str = "read",
+) -> bool:
+    """Check an active grant against PostgreSQL at the time of the operation."""
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM identity.region_grants
+                WHERE user_id = $1::uuid
+                  AND region_code = $2
+                  AND permission IN ($3, 'admin')
+                  AND revoked_at IS NULL
+            )
+            """,
+            principal_id,
+            region_code,
+            permission,
+        )
+    )
+
+
+async def _audit_region_denial(
+    conn: asyncpg.Connection, request: Request, principal_id: str, region_code: str
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO audit.audit_events
+            (actor_type, actor_id, action, resource_type, resource_id, decision,
+             reason_code, metadata_json, trace_id)
+        VALUES ('user', $1::uuid, 'region.authorization', 'region', $2::text, 'denied',
+                'REGION_ACCESS_DENIED', jsonb_build_object('region_code', $2::text), $3)
+        """,
+        principal_id,
+        region_code,
+        request.state.request_id,
+    )
+
+
+async def authorize_region(
+    conn: asyncpg.Connection,
+    request: Request,
+    principal: dict[str, Any],
+    region_code: str,
+    permission: str = "read",
+) -> None:
+    if await require_region_grant(
+        conn,
+        principal_id=principal["id"],
+        region_code=region_code,
+        permission=permission,
+    ):
+        return
+    await _audit_region_denial(conn, request, principal["id"], region_code)
+    raise ApiError(403, "REGION_ACCESS_DENIED", "Access to this region is denied")
+
+
+def _error_response(request: Request, error: ApiError) -> JSONResponse:
+    return JSONResponse(
+        status_code=error.status_code,
+        content={
+            "error": {
+                "code": error.code,
+                "message": error.message,
+                "retryable": error.retryable,
+                "details": error.details,
+            },
+            "request_id": request.state.request_id,
+        },
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or Settings()
 
-    app = FastAPI(title="AgentForge API")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.settings = app_settings
+        app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
+        yield
+
+    app = FastAPI(title="AgentForge API", lifespan=lifespan)
+    # ASGI tests may use HTTPX's ASGITransport without starting lifespan.
+    app.state.settings = app_settings
+    app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @app.exception_handler(ApiError)
+    async def handle_api_error(request: Request, error: ApiError) -> JSONResponse:
+        return _error_response(request, error)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(
+        request: Request, error: StarletteHTTPException
+    ) -> JSONResponse:
+        if error.status_code == 404:
+            api_error = ApiError(
+                404,
+                "NOT_FOUND",
+                "The requested resource was not found",
+            )
+        elif error.status_code == 405:
+            api_error = ApiError(
+                405,
+                "METHOD_NOT_ALLOWED",
+                "The request method is not allowed",
+            )
+        else:
+            api_error = ApiError(
+                error.status_code,
+                "HTTP_ERROR",
+                "The request could not be completed",
+            )
+        return _error_response(request, api_error)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        return _error_response(
+            request,
+            ApiError(
+                400,
+                "INVALID_REQUEST",
+                "The request is invalid",
+                details={
+                    "fields": sorted(
+                        ".".join(str(part) for part in item["loc"])
+                        for item in error.errors()
+                    )
+                },
+            ),
+        )
 
     @app.get("/health/live")
     async def health_live() -> dict[str, str]:
@@ -21,6 +192,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body = await check_database_readiness(app_settings.api_db_dsn)
         status_code = 200 if body["status"] == "ready" else 503
         return JSONResponse(status_code=status_code, content=body)
+
+    @app.post("/api/v1/auth/login")
+    async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
+        normalized_email = body.email.strip().lower()
+        async with app.state.connect() as conn:
+            user = await conn.fetchrow(
+                """
+                SELECT id::text AS id, password_hash, status, token_version
+                FROM identity.users WHERE email = $1
+                """,
+                normalized_email,
+            )
+            valid_password = await verify_password(
+                body.password, user["password_hash"] if user is not None else None
+            )
+            if user is None or not valid_password or user["status"] != "active":
+                await log_auth_failure(conn, request, "invalid_credentials")
+                raise ApiError(401, "UNAUTHENTICATED", "Invalid email or password")
+
+            token, expires_in = create_access_token(
+                user_id=user["id"],
+                token_version=user["token_version"],
+                secret=app_settings.jwt_secret,
+                ttl_seconds=app_settings.jwt_ttl_seconds,
+            )
+        return {"access_token": token, "token_type": "bearer", "expires_in": expires_in}
+
+    @app.get("/api/v1/auth/me")
+    async def current_user(
+        request: Request, principal: dict[str, Any] = Depends(current_principal)
+    ) -> dict[str, Any]:
+        async with app.state.connect() as conn:
+            grants = await conn.fetch(
+                """
+                SELECT region_code, permission
+                FROM identity.region_grants
+                WHERE user_id = $1::uuid AND revoked_at IS NULL
+                ORDER BY region_code, permission
+                """,
+                principal["id"],
+            )
+        return {
+            "id": principal["id"],
+            "email": principal["email"],
+            "display_name": principal["display_name"],
+            "regions": [dict(grant) for grant in grants],
+        }
+
+    @app.get("/api/v1/regions/{region_code}/access")
+    async def check_region_access(
+        region_code: str,
+        request: Request,
+        principal: dict[str, Any] = Depends(current_principal),
+    ) -> dict[str, Any]:
+        async with app.state.connect() as conn:
+            await authorize_region(conn, request, principal, region_code)
+        return {"region_code": region_code, "permission": "read", "allowed": True}
 
     return app
 

@@ -6,7 +6,10 @@ requires-python = ">=3.12"
 dependencies = [
     "agentforge-core",
     "fastapi>=0.115",
+    "pydantic>=2.8",
     "pydantic-settings>=2.5",
+    "PyJWT>=2.9",
+    "argon2-cffi>=23.1",
     "uvicorn>=0.30",
 ]
 
