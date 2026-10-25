@@ -4,11 +4,15 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] 登录成功返回有效期 ≤15 分钟的 JWT；错误凭据返回 401 UNAUTHENTICATED
-- [ ] disabled 用户登录被拒；token_version 变更后旧 JWT 立即失效
-- [ ] 无凭证/过期凭证访问业务 API 返回 401，统一错误体（code/message/retryable/request_id）
-- [ ] 当前用户端点返回身份与活跃区域授权列表（ revoked 的不出现在内）
-- [ ] 撤销区域授权后，实时权限查询立即不再返回该区域（HS-11 的基础）
-- [ ] 登录失败与区域权限拒绝产生审计事件
+- [x] 登录成功返回有效期 ≤15 分钟的 JWT；错误凭据返回 401 UNAUTHENTICATED
+- [x] disabled 用户登录被拒；token_version 变更后旧 JWT 立即失效
+- [x] 无凭证/过期凭证访问业务 API 返回 401，统一错误体（code/message/retryable/request_id）
+- [x] 当前用户端点返回身份与活跃区域授权列表（ revoked 的不出现在内）
+- [x] 撤销区域授权后，实时权限查询立即不再返回该区域（HS-11 的基础）
+- [x] 登录失败与区域权限拒绝产生审计事件
+
+**Resolution:** Merged into `integration/p0` at `b355af8`.
+
+**Verification:** Full Offline + PostgreSQL Integration suite passed: 38 passed after migration sequence guard was included.
