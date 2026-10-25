@@ -209,21 +209,6 @@ def _migrate_database(server: dict, name: str, env: Mapping[str, str]) -> None:
     run_async(_migrate_database_async(server, name, env))
 
 
-async def _prepare_unmigrated_database(dsn: str) -> None:
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(
-            "CREATE SCHEMA agentforge; "
-            "CREATE TABLE agentforge.schema_migrations "
-            "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, "
-            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now()); "
-            "GRANT USAGE ON SCHEMA agentforge TO agentforge_api; "
-            "GRANT SELECT ON agentforge.schema_migrations TO agentforge_api"
-        )
-    finally:
-        await conn.close()
-
-
 @pytest.fixture(scope="session")
 def migrated_template_db(postgres_server):
     """One migrated template database for this integration session."""
@@ -257,15 +242,10 @@ def migrated_db(postgres_server, migrated_template_db):
 
 
 @pytest.fixture
-def unmigrated_db(postgres_server, migrated_template_db):
-    """A fresh database with an empty, readable migration ledger."""
+def unmigrated_db(postgres_server):
+    """A fresh database that has never had a migration applied."""
     name = f"agentforge_it_{uuid.uuid4().hex[:8]}"
-    _create_database(postgres_server, name, owner="postgres")
-    run_async(
-        _prepare_unmigrated_database(
-            f"{postgres_server['superuser_dsn_prefix']}/{name}"
-        )
-    )
+    _create_database(postgres_server, name, owner="agentforge_migrator")
     try:
         yield {
             "name": name,

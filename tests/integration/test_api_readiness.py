@@ -19,7 +19,21 @@ async def _get_ready(dsn: str):
         return await client.get("/health/ready")
 
 
-async def test_ready_refuses_database_without_migration(unmigrated_db):
+async def test_ready_refuses_database_without_migration(unmigrated_db, migrated_db):
+    # The API role exists on the cluster after the baseline migration, so grant
+    # it access to the empty ledger in this separate, fresh database.
+    conn = await asyncpg.connect(unmigrated_db["superuser_dsn"])
+    try:
+        await conn.execute(
+            "CREATE SCHEMA agentforge; "
+            "CREATE TABLE agentforge.schema_migrations "
+            "(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, "
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now()); "
+            "GRANT USAGE ON SCHEMA agentforge TO agentforge_api; "
+            "GRANT SELECT ON agentforge.schema_migrations TO agentforge_api"
+        )
+    finally:
+        await conn.close()
     response = await _get_ready(unmigrated_db["role_dsn"]("api"))
 
     assert response.status_code == 503
