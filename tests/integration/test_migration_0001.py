@@ -207,6 +207,82 @@ async def test_raw_reexecution_after_clearing_bookkeeping_succeeds(migrated_db):
     assert schema_count == len(EXPECTED_SCHEMAS)
 
 
+async def test_gapped_migration_directory_fails_before_applying_any_file(
+    unmigrated_db, tmp_path
+):
+    (tmp_path / "0001_first.sql").write_text(
+        "CREATE TABLE public.migration_gap_effect (version INTEGER NOT NULL); "
+        "INSERT INTO public.migration_gap_effect VALUES (1);",
+        encoding="utf-8",
+    )
+    (tmp_path / "0003_third.sql").write_text(
+        "INSERT INTO public.migration_gap_effect VALUES (3);", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        MigrationError,
+        match=r"migration files are not contiguous: missing version 0002",
+    ):
+        await apply_migrations(unmigrated_db["superuser_dsn"], tmp_path, {})
+
+    conn = await _connect(unmigrated_db["superuser_dsn"])
+    try:
+        table = await conn.fetchval(
+            "SELECT to_regclass('public.migration_gap_effect')"
+        )
+    finally:
+        await conn.close()
+    assert table is None
+
+
+async def test_gapped_migration_ledger_fails_before_applying_pending_migration(
+    unmigrated_db, tmp_path
+):
+    dsn = unmigrated_db["superuser_dsn"]
+    conn = await _connect(dsn)
+    try:
+        await conn.execute(
+            "CREATE TABLE public.migration_gap_executions (version INTEGER NOT NULL)"
+        )
+    finally:
+        await conn.close()
+
+    (tmp_path / "0001_first.sql").write_text(
+        "INSERT INTO public.migration_gap_executions VALUES (1);", encoding="utf-8"
+    )
+    (tmp_path / "0002_second.sql").write_text(
+        "INSERT INTO public.migration_gap_executions VALUES (2);", encoding="utf-8"
+    )
+    await apply_migrations(dsn, tmp_path, {})
+
+    conn = await _connect(dsn)
+    try:
+        await conn.execute(
+            "DELETE FROM agentforge.schema_migrations WHERE version = 1"
+        )
+    finally:
+        await conn.close()
+
+    with pytest.raises(
+        MigrationError,
+        match=r"migration ledger is not contiguous: missing version 0001",
+    ):
+        await apply_migrations(dsn, tmp_path, {})
+
+    conn = await _connect(dsn)
+    try:
+        executions = await conn.fetchval(
+            "SELECT count(*) FROM public.migration_gap_executions"
+        )
+        ledger_versions = await conn.fetch(
+            "SELECT version FROM agentforge.schema_migrations ORDER BY version"
+        )
+    finally:
+        await conn.close()
+    assert executions == 2
+    assert [row["version"] for row in ledger_versions] == [2]
+
+
 async def test_api_role_reads_version_table_but_cannot_create_tables(migrated_db):
     conn = await _connect(migrated_db["role_dsn"]("api"))
     try:
