@@ -6,7 +6,7 @@ to report ready unless it exactly matches the version this build expects.
 
 from typing import Literal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ReadinessDecision = Literal["ok", "not_migrated", "version_mismatch"]
 

@@ -6,6 +6,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentforge-local-bootstrap}
       POSTGRES_DB: agentforge
       AGENTFORGE_MIGRATOR_DB_PASSWORD: ${AGENTFORGE_MIGRATOR_DB_PASSWORD:-agentforge-local-migrator}
+      AGENTFORGE_REGISTRY_DB_PASSWORD: ${AGENTFORGE_REGISTRY_DB_PASSWORD:-agentforge-local-registry}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -22,6 +23,7 @@ services:
     environment:
       AGENTFORGE_MIGRATOR_DSN: postgresql://agentforge_migrator:${AGENTFORGE_MIGRATOR_DB_PASSWORD:-agentforge-local-migrator}@postgres:5432/agentforge
       AGENTFORGE_MIGRATOR_DB_PASSWORD: ${AGENTFORGE_MIGRATOR_DB_PASSWORD:-agentforge-local-migrator}
+      AGENTFORGE_REGISTRY_DB_PASSWORD: ${AGENTFORGE_REGISTRY_DB_PASSWORD:-agentforge-local-registry}
       AGENTFORGE_API_DB_PASSWORD: ${AGENTFORGE_API_DB_PASSWORD:-agentforge-local-api}
       AGENTFORGE_WORKER_DB_PASSWORD: ${AGENTFORGE_WORKER_DB_PASSWORD:-agentforge-local-worker}
       AGENTFORGE_BUSINESS_RO_DB_PASSWORD: ${AGENTFORGE_BUSINESS_RO_DB_PASSWORD:-agentforge-local-business-ro}
