@@ -14,6 +14,8 @@ The PostgreSQL init script creates `agentforge_migrator` as a non-superuser with
 
 Registry operations use the `agentforge-registry` command with `AGENTFORGE_REGISTRY_DSN` pointing to a connection as `agentforge_registry_cli`. That login has schema usage and DML on the four Registry tables; publication and retirement rules are enforced by database triggers. Published Agent versions retain their frozen model configuration even if the source model profile changes.
 
+Migration filenames follow the order that completed slices were integrated. Versions 0001–0005 contain roles/schemas, identity, the business dataset, Registry, and snapshot integrity respectively. The design baseline's original migration table describes its planned grouping; the checked-in `migrations/versions` directory defines the executable order. New changes append the next contiguous version. Applied filenames and content checksums must stay unchanged.
+
 To remove the local database and reinitialize from scratch, use `docker compose down -v`.
 
 ## Test tiers
