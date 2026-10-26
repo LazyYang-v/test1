@@ -58,14 +58,14 @@ async def test_ready_requires_exact_migration_version(migrated_db):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 6,
-        "applied_schema_version": 6,
+        "expected_schema_version": 7,
+        "applied_schema_version": 7,
     }
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
-            "UPDATE agentforge.schema_migrations SET version = 7 WHERE version = 6"
+            "UPDATE agentforge.schema_migrations SET version = 8 WHERE version = 7"
         )
     finally:
         await conn.close()
