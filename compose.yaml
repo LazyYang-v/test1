@@ -33,6 +33,21 @@ services:
         condition: service_healthy
     restart: "no"
 
+  seed:
+    build: .
+    # Deterministic dataset generation and load are idempotent: the loader is
+    # a no-op once the frozen snapshot is complete, and the content hash must
+    # stay stable across environments.
+    command: ["/bin/sh", "-c", "agentforge-dataset /tmp/business.jsonl && agentforge-seed /tmp/business.jsonl"]
+    environment:
+      AGENTFORGE_MIGRATOR_DSN: postgresql://agentforge_migrator:${AGENTFORGE_MIGRATOR_DB_PASSWORD:-agentforge-local-migrator}@postgres:5432/agentforge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     build: .
     environment:
@@ -41,6 +56,8 @@ services:
       postgres:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      seed:
         condition: service_completed_successfully
     ports:
       - "${AGENTFORGE_API_PORT:-8000}:8000"
@@ -93,10 +110,56 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp
 
+  # Optional observability stack: started only with
+  #   docker compose --profile observability up
+  # Default cold start never requires these services. Enable OTLP export in
+  # the API/Worker with AGENTFORGE_OTEL_ENABLED=true and point
+  # AGENTFORGE_OTEL_EXPORTER_OTLP_ENDPOINT at tempo:4318.
+  tempo:
+    image: grafana/tempo:2.6.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./infra/observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    profiles: ["observability"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./infra/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infra/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${AGENTFORGE_GRAFANA_PORT:-3001}:3000"
+    profiles: ["observability"]
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    profiles: ["observability"]
+
 volumes:
   postgres_data:
+  tempo_data:
+  prometheus_data:
+  grafana_data:
