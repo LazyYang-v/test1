@@ -21,10 +21,11 @@
 
 ### Verification (2026-10-26, pending integration)
 
-- Branch: `ticket/06-tracer-bullet-task-completion`; commits `f8e71ba`, `018c97b`, `239db3f`, `29dcd36`.
+- Branch: `ticket/06-tracer-bullet-task-completion`; commits `f8e71ba`, `018c97b`, `239db3f`, `29dcd36`, `0d93854`.
 - Migration: additive `0008_runtime_harness_evidence.sql`; `SCHEMA_VERSION` and readiness/migration expectations are 8; 0001-0007 unchanged.
 - Merge: `integration/p0` tip `9e7dc39` merged into the ticket branch ("Already up to date").
-- Full suite: `uv run pytest -q --tb=short` -> `341 passed in 260.61s (0:04:20)` on the continuous 0001-0008 sequence.
+- Full suite: `uv run pytest -q --tb=short` -> `348 passed in 279.89s (0:04:39)` on the continuous 0001-0008 sequence.
+- Review fixes: `load_agent` now takes provider/model_name/timeout/max_output_tokens from the frozen `model_config_snapshot` (profile only as legacy fallback); a regression test publishes via the Registry CLI, mutates the profile to a different provider/name/timeout, and proves the worker still records `fake`/`fake-v1` and times out at the frozen 50ms. `merge_policy` now accepts `require_*` base `false -> true` while rejecting `false -> false`, matching migration 0007.
 - `diff --check integration/p0...HEAD` -> clean.
 - Evidence: `POST /api/v1/tasks` -> real worker -> `GET /api/v1/tasks/{id}` completed with a schema-valid report (CN_EAST 2025-03-31..2025-04-07: 57400.00 vs 70000.00, -12600.00, -0.1800). Persisted events are contiguous seq 1-7 with four ordered `step.completed` rows for `plan_metrics:0`, `execute_metrics:0`, `compose_analysis:0`, `validate_report:0`.
 - Negative paths: two concurrent claims produce one attempt; heartbeat renewal observed during a blocked model call; expired/fenced confirmation rejected with no step/event; invalid JSON exhausts three bounded attempts then fails `MODEL_OUTPUT_INVALID` with a failed step and no evidence/completion; unbound tool and invalid arguments fail closed with denied `tool.invocation` audit; missing and foreign evidence fail `validate_report`; no Task tuple lock or idle-in-transaction session is observed while the model is blocked.
