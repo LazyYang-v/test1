@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     api_db_dsn: str = "postgresql://agentforge_api@localhost:5432/agentforge"
     jwt_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(48), min_length=32)
     jwt_ttl_seconds: int = Field(default=900, ge=1, le=900)
+    live_evaluations_enabled: bool = False
+    live_evaluation_call_budget_limit: int = Field(default=0, ge=0, le=1000)
 
     @field_validator("api_db_dsn")
     @classmethod

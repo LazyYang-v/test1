@@ -21,6 +21,7 @@ from agentforge_api.auth import (
     verify_password,
 )
 from agentforge_api.config import Settings
+from agentforge_api.evaluations import router as evaluation_router
 from agentforge_api.readiness import check_database_readiness
 from agentforge_api.tasks import router as task_router
 
@@ -126,6 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="AgentForge API", lifespan=lifespan)
     app.include_router(task_router)
+    app.include_router(evaluation_router)
     # ASGI tests may use HTTPX's ASGITransport without starting lifespan.
     app.state.settings = app_settings
     app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)

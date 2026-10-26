@@ -23,6 +23,10 @@ logger = logging.getLogger("agentforge.worker")
 
 
 def classify_error(error: BaseException) -> str:
+    if getattr(error, "code", None) == "BUDGET_EXCEEDED":
+        return "BUDGET_EXCEEDED"
+    if getattr(error, "code", None) == "LIVE_MODEL_UNAVAILABLE":
+        return "LIVE_MODEL_UNAVAILABLE"
     if isinstance(error, (ModelOutputError, ModelTimeoutError)):
         return error.code
     if isinstance(error, (ReportValidationError, ToolError, UnsupportedGraphError)):
@@ -42,6 +46,8 @@ class Worker:
         model,
         *,
         graph: AnalysisGraph | None = None,
+        fake_model=None,
+        live_model=None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -54,7 +60,14 @@ class Worker:
         self.gateway = ToolGateway(
             backend, {"metrics.query": self.executor}
         )
-        self.graph = graph or AnalysisGraph(store, model, self.gateway, settings)
+        self.graph = graph or AnalysisGraph(
+            store,
+            model,
+            self.gateway,
+            settings,
+            fake_model=fake_model or model,
+            live_model=live_model,
+        )
 
     async def close(self) -> None:
         await self.executor.close()
