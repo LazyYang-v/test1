@@ -85,7 +85,17 @@ def test_confirmed_tool_step_must_match_its_durable_invocation_and_evidence():
 
 def test_valid_confirmed_tool_result_matches_invocation_and_snapshot_evidence():
     plan = {"metric": "gmv", "metric_version": 1}
-    tool_result = {"metric": "gmv", "current_value": "57400.00"}
+    tool_result = {
+        "metric": "gmv",
+        "metric_version": 1,
+        "unit": "CNY",
+        "current_value": "57400.00",
+        "previous_value": "70000.00",
+        "absolute_change": "-12600.00",
+        "change_rate": "-0.1800",
+        "row_count": 1400,
+        "data_snapshot_id": "snapshot-1",
+    }
     invocation_id = "invocation-1"
     evidence_id = "evidence-1"
     steps = [
@@ -96,16 +106,40 @@ def test_valid_confirmed_tool_result_matches_invocation_and_snapshot_evidence():
             {"tool_result": tool_result, "evidence_id": evidence_id},
         ),
     ]
+    persisted_hash = _hash(tool_result)
     invocations = [{
         "invocation_id": invocation_id,
         "status": "succeeded",
         "result_json": tool_result,
         "evidence_id": evidence_id,
+        # The store loader returns evidence_* columns for joined evidence.
+        "evidence_metric_key": "gmv",
+        "evidence_metric_version": 1,
+        "evidence_unit": "CNY",
+        "evidence_current_value": "57400.00",
+        "evidence_previous_value": "70000.00",
+        "evidence_absolute_change": "-12600.00",
+        "evidence_change_rate": "-0.1800",
+        "evidence_row_count": 1400,
+        "evidence_snapshot_id": "snapshot-1",
+        "evidence_invocation_id": invocation_id,
+        "evidence_result_json": tool_result,
+        "evidence_result_hash": persisted_hash,
     }]
     evidences = [{
         "evidence_id": evidence_id,
         "tool_invocation_id": invocation_id,
         "data_snapshot_id": "snapshot-1",
+        "metric_key": "gmv",
+        "metric_version": 1,
+        "unit": "CNY",
+        "current_value": "57400.00",
+        "previous_value": "70000.00",
+        "absolute_change": "-12600.00",
+        "change_rate": "-0.1800",
+        "row_count": 1400,
+        "result_json": tool_result,
+        "result_hash": persisted_hash,
     }]
 
     assert validate_recovery_records(

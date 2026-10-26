@@ -24,6 +24,7 @@ from agentforge_api.auth import (
 )
 from agentforge_api.config import Settings
 from agentforge_api.evaluations import router as evaluation_router
+from agentforge_core.faults import NOOP_FAULT_INJECTOR
 from agentforge_api.readiness import check_database_readiness
 from agentforge_api.observability import (
     configure_json_logging,
