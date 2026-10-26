@@ -33,6 +33,7 @@ OTHER_USER_ID = "0192a3b4-c5d6-7e8f-9012-3456789abcdf"
 def _settings(db: dict, **overrides) -> WorkerSettings:
     values = {
         "worker_db_dsn": db["role_dsn"]("worker"),
+        "business_ro_db_dsn": db["role_dsn"]("business_ro"),
         "worker_id": "worker-cancel",
         "heartbeat_interval_seconds": 0.05,
         "lease_seconds": 5,
