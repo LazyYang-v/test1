@@ -48,7 +48,7 @@ async def test_creates_all_seven_schemas(migrated_db):
     assert {row["nspname"] for row in rows} == EXPECTED_SCHEMAS
 
 
-async def test_creates_all_five_roles_all_non_superuser(migrated_db):
+async def test_creates_all_six_roles_all_non_superuser(migrated_db):
     conn = await _connect(migrated_db["superuser_dsn"])
     try:
         rows = await conn.fetch(
