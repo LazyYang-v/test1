@@ -4,7 +4,7 @@
 
 **Blocked by:** 06
 
-**Status:** claimed
+**Status:** ready-for-human
 
 2026-10-26: Implementation started on `ticket/14-observability-rate-limit-work` from `integration/p0` tip `ac8ee23`. Scope: additive Task trace ID migration 0009, structured redacted API/Worker logs, optional OTel readiness, and bounded per-principal API token-bucket limiting. Main seam: HTTP API with real PostgreSQL and deterministic fake-clock limiter tests. Full Docker suite deferred while ticket 08 verification is active.
 
@@ -14,3 +14,7 @@
 - [ ] 按用户令牌桶限流：超限 429 + Retry-After；限流语义为单进程，不宣称多副本全局
 - [ ] 任一失败任务可凭 trace_id 定位到步骤与错误类别（Release Gate 观测项）
 - [ ] Compose 中 Tempo/Prometheus/Grafana/Redis 仅存在于可选 profile，缺省冷启动不依赖它们
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `7449a66` (+ trace-column test adaptation `56fe19f`). Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

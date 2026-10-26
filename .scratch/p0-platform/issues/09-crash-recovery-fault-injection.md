@@ -4,7 +4,7 @@
 
 **Blocked by:** 06、08
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [ ] 八个崩溃窗口（创建事务前后、领取后、模型期间/返回后、工具落库前后、步骤确认后、终态前）各有精确注入点，测试不依赖随机杀进程
 - [ ] 心跳停止 → 租约过期 → 扫描器标旧 Attempt abandoned → 任务经 recovering 恢复流转（RT-06）
@@ -14,3 +14,7 @@
 - [ ] 无法确认恢复状态 → failed + 诊断证据保留，绝不伪造成功
 - [ ] 恢复期间模型调用如发生重复，成本如实记账（model_invocations 如实记录）
 - [ ] 故障注入测试全部确定性可重复运行
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `851fcfd` (+ fix `be50a43`). Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

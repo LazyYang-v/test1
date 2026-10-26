@@ -4,10 +4,14 @@
 
 **Blocked by:** 07、11
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [ ] 登录后提交任务表单（agent、区域、左闭右开日期、比较模式），成功拿到 task_id 并跳转详情
 - [ ] 详情页实时显示任务状态与事件流（EventSource + Last-Event-ID 重连）
 - [ ] 终态后渲染完整报告：指标数值、变化率、发现（含证据引用）、假设（标注待验证）、建议、局限
 - [ ] 401/403/404/409/429 等错误有用户可读的呈现与重试引导
 - [ ] 核心流程（提交 → 观察 → 读报告）可对非技术干系人现场演示
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `f66353d`. Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

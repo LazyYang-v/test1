@@ -4,7 +4,7 @@
 
 **Blocked by:** 07
 
-**Status:** claimed
+**Status:** ready-for-human
 
 - [ ] Metric Query Plan 只接受注册指标/维度/过滤；未注册 → 422 QUERY_PLAN_INVALID
 - [ ] 管线六段成型，模板路径被完全替换；结果经 ResultNormalizer 归一
@@ -18,3 +18,7 @@
 ## Comments
 
 2026-10-26: Implementation started on `ticket/10-semantic-layer-compiler` from `integration/p0` tip `ac8ee23`. Scope: replace the focused GMV compiler with a registry-driven plan/compile/AST-validation/execution/normalization pipeline while preserving the ticket 07 API-to-worker Evidence behavior. Status claimed; resolution remains with the merger.
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `a1b262b`. Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

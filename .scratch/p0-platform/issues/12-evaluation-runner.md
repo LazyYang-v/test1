@@ -4,7 +4,7 @@
 
 **Blocked by:** 07
 
-**Status:** claimed
+**Status:** ready-for-human
 
 - [x] datasets/cases/runs/case_results 落库；dataset 显式绑定 data_snapshot_id
 - [x] `POST /evaluations/runs` 发起评测；评测任务 owner 为 svc-eval，不出现在普通用户任务列表
@@ -13,3 +13,7 @@
 - [x] 「模型虚构原因」类案例以结构断言覆盖：hypotheses 不得冒充 findings、findings 必须引用有效证据
 - [x] 默认 Fake Model；Live 模式需显式开关 + 调用预算，超预算立即停止
 - [x] 评测不改写任务原始结果，只读取与判定
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `3c060ec`, with the migration-0011/wiring repair `6344216` (fixes malformed seed UUIDs, binds eval tasks to runs via `eval_run_id`/`trace_id`, grants API/worker roles evaluation DML, threads `fake_model`/`live_model` selection through the Worker; offline tier 181 passed, all 12 migrations parse under libpg_query). Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

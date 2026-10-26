@@ -4,7 +4,7 @@
 
 **Blocked by:** 06
 
-**Status:** claimed
+**Status:** ready-for-human
 
 - [ ] 事件先持久化后通知；SSE id = task_event_seq，任务内严格递增
 - [ ] 支持 Last-Event-ID：断线重连从该序号补发全部后续事件（RT-13）
@@ -16,3 +16,7 @@
 ## Comments
 
 - 2026-10-26: Claimed ticket 11 and started implementing the authenticated, owner-scoped SSE endpoint with persisted replay and PostgreSQL notification wakeups.
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `0c16be5` (+ SSE fixture fix `25915b0`). Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.

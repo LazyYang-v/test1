@@ -4,7 +4,7 @@
 
 **Blocked by:** 07
 
-**Status:** claimed
+**Status:** ready-for-human
 
 - [x] DeepSeek 与 Fake Model 经不可变模型快照选择同一 ModelAdapter 协议，不改图路径
 - [x] 请求侧约束落实：Prompt 含 "json" 与 JSON 示例；json_object 模式；空 content 与截断被视为可修复失败而非成功
@@ -16,3 +16,7 @@
 ## Comments
 
 2026-10-26: Implementation on `ticket/13-deepseek-live-adapter`, starting from ticket 08 handoff `2185d8a` (which contains integration/p0 through `ac8ee23`). Fake/DeepSeek adapter selection, mocked provider contract, bounded JSON validation/repair, transient error classification, and invocation metadata persistence are implemented. Offline/unit verification only; shared Docker/PostgreSQL integration tests are deferred until coordinated. No live DeepSeek call was made and provider spend is zero. The real live run is deferred to Release Gate.
+
+## Comments
+
+- 2026-10-27 (orchestrator): ticket branch merged into `integration/p0` at `68872bf`. Post-merge integration-tier verification is pending: the current environment cannot run Docker/PostgreSQL, so the ticket is handed to a human/CI environment to execute `uv run pytest tests/integration -q` and confirm the acceptance boxes above. See `docs/verification/release-gate-evidence.md`.
