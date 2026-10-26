@@ -86,6 +86,7 @@ class Worker:
     async def run_attempt(self, lease: AttemptLease) -> None:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
+        heartbeat_failed = asyncio.Event()
         cancel_seen = asyncio.Event()
         deadline_seen = asyncio.Event()
 
@@ -94,11 +95,15 @@ class Worker:
                 try:
                     alive = await self.store.heartbeat(lease)
                 except Exception:
+                    # A transient DB error says nothing about ownership. Stop
+                    # doing work, but leave the live Attempt row for expiry and
+                    # scanner recovery to decide.
                     logger.exception(
                         "heartbeat failed",
                         extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
                     )
-                    alive = False
+                    heartbeat_failed.set()
+                    return
                 if not alive:
                     lease_lost.set()
                     return
@@ -141,13 +146,28 @@ class Worker:
         watcher = asyncio.create_task(watch_loop())
         graph_task = asyncio.create_task(self.graph.run(lease))
         lease_lost_waiter = asyncio.create_task(lease_lost.wait())
+        heartbeat_failed_waiter = asyncio.create_task(heartbeat_failed.wait())
         cancel_waiter = asyncio.create_task(cancel_seen.wait())
         deadline_waiter = asyncio.create_task(deadline_seen.wait())
         try:
             await asyncio.wait(
-                {graph_task, lease_lost_waiter, cancel_waiter, deadline_waiter},
+                {
+                    graph_task,
+                    lease_lost_waiter,
+                    heartbeat_failed_waiter,
+                    cancel_waiter,
+                    deadline_waiter,
+                },
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if heartbeat_failed.is_set():
+                await self._stop_graph(graph_task)
+                logger.warning(
+                    "heartbeat unavailable; retaining attempt for lease expiry",
+                    extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                )
+                return
 
             if lease_lost.is_set():
                 await self._stop_graph(graph_task)
@@ -197,6 +217,7 @@ class Worker:
             stop.set()
             for task in (
                 lease_lost_waiter,
+                heartbeat_failed_waiter,
                 cancel_waiter,
                 deadline_waiter,
                 watcher,
@@ -209,6 +230,7 @@ class Worker:
                 heartbeat,
                 watcher,
                 lease_lost_waiter,
+                heartbeat_failed_waiter,
                 cancel_waiter,
                 deadline_waiter,
                 graph_task,

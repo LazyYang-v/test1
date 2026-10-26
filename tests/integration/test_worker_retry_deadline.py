@@ -84,6 +84,19 @@ async def _make_due(db: dict, task_id: str) -> None:
         await conn.close()
 
 
+async def _set_deadline(db: dict, task_id: str, *, expired: bool) -> None:
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        operator = "-" if expired else "+"
+        await conn.execute(
+            f"UPDATE runtime.tasks SET deadline_at = now() {operator} interval '1 second' "
+            "WHERE id = $1::uuid",
+            task_id,
+        )
+    finally:
+        await conn.close()
+
+
 async def _expire_lease(db: dict, task_id: str) -> None:
     conn = await asyncpg.connect(db["role_dsn"]("migrator"))
     try:
@@ -377,6 +390,122 @@ async def test_deadline_is_enforced_at_worker_node_boundary(migrated_db):
     assert [event["type"] for event in events].count("task.failed") == 1
     assert "task.completed" not in [event["type"] for event in events]
     assert "task.cancelled" not in [event["type"] for event in events]
+
+
+async def test_transient_heartbeat_error_retains_live_attempt_for_scanner_recovery(
+    migrated_db, monkeypatch
+):
+    db = migrated_db
+    task_id = await _prepared_task(db, max_attempts=3)
+    worker = await _worker(db, FakeModel())
+
+    class BlockingGraph:
+        async def run(self, _lease):
+            await asyncio.Future()
+
+    worker.graph = BlockingGraph()
+
+    async def transient_failure(_lease):
+        raise OSError("temporary database disconnect")
+
+    monkeypatch.setattr(worker.store, "heartbeat", transient_failure)
+    try:
+        assert await worker.run_once() is True
+    finally:
+        await worker.close()
+
+    task = await fetch_task(db, task_id)
+    attempts = await fetch_attempts(db, task_id)
+    assert task["status"] == "running"
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "running"
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        lease_alive = await conn.fetchval(
+            "SELECT lease_expires_at > now() FROM runtime.task_attempts "
+            "WHERE task_id = $1::uuid AND status = 'running'",
+            task_id,
+        )
+    finally:
+        await conn.close()
+    assert lease_alive is True
+
+    store = await _store(db, worker_id="worker-heartbeat-recovery")
+    try:
+        counts = await store.reconcile()
+        assert counts["recovered_leases"] == 0
+        assert (await fetch_task(db, task_id))["status"] == "running"
+
+        await _expire_lease(db, task_id)
+        counts = await store.reconcile()
+        assert counts["recovered_leases"] == 1
+        assert (await fetch_task(db, task_id))["status"] == "recovering"
+        await store.reconcile()
+        assert (await fetch_task(db, task_id))["status"] == "queued"
+
+        recovered = await store.claim()
+        assert recovered is not None
+        assert recovered.attempt_no == 2
+        assert recovered.fencing_epoch == 2
+    finally:
+        await store.close()
+
+
+async def test_cancel_accepted_before_deadline_wins_worker_and_scanner_races(
+    migrated_db,
+):
+    db = migrated_db
+    task_id = await _prepared_task(db, max_attempts=3)
+    store = await _store(db, worker_id="worker-cancel-deadline")
+    try:
+        lease = await store.claim()
+        assert lease is not None
+        await _set_deadline(db, task_id, expired=False)
+        task = await fetch_task(db, task_id)
+        response = await post_cancel_via_api(db, task_id, task["version"])
+        assert response.status_code == 202
+
+        # Model a delayed worker stop: the deadline passes after cancellation
+        # committed but before the worker performs its fenced terminal write.
+        await _set_deadline(db, task_id, expired=True)
+        assert await store.stop_reason(lease) == "CANCELLED"
+        assert await store.expire_task(lease) is True
+    finally:
+        await store.close()
+
+    task = await fetch_task(db, task_id)
+    assert task["status"] == "cancelled"
+    assert task["error_code"] is None
+    events = await fetch_events(db, task_id)
+    assert [event["type"] for event in events].count("task.cancelled") == 1
+    assert "task.failed" not in [event["type"] for event in events]
+
+    # The scanner applies the same precedence after the running lease expires.
+    await seed_agent(db, agent_key="sales-report-scanner")
+    await complete_dataset_load(db)
+    scanner_task_id = await create_task_via_api(
+        db, agent_key="sales-report-scanner", max_attempts=3
+    )
+    scanner_store = await _store(db, worker_id="worker-cancel-deadline-scan")
+    try:
+        scanner_lease = await scanner_store.claim()
+        assert scanner_lease is not None
+        scanner_task = await fetch_task(db, scanner_task_id)
+        response = await post_cancel_via_api(
+            db, scanner_task_id, scanner_task["version"]
+        )
+        assert response.status_code == 202
+        await _set_deadline(db, scanner_task_id, expired=True)
+        await _expire_lease(db, scanner_task_id)
+        await scanner_store.reconcile()
+    finally:
+        await scanner_store.close()
+
+    scanner_task = await fetch_task(db, scanner_task_id)
+    assert scanner_task["status"] == "cancelled"
+    scanner_events = await fetch_events(db, scanner_task_id)
+    assert [event["type"] for event in scanner_events].count("task.cancelled") == 1
+    assert "task.failed" not in [event["type"] for event in scanner_events]
 
 
 async def test_cancelling_with_lost_lease_goes_recovering_then_cancelled(migrated_db):

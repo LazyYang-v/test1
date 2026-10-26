@@ -277,14 +277,16 @@ class RuntimeStore:
             )
         if row is None or not row["lease_alive"]:
             return "LEASE_LOST"
-        if row["expired"]:
-            return "DEADLINE_EXCEEDED"
+        # A committed cancellation request wins races with deadline expiry.
         if (
-            row["status"] not in {"running", "cancelling"}
-            or row["cancel_requested_at"] is not None
+            row["cancel_requested_at"] is not None
             or row["cancel_event"]
             or row["status"] == "cancelling"
         ):
+            return "CANCELLED"
+        if row["expired"]:
+            return "DEADLINE_EXCEEDED"
+        if row["status"] != "running":
             return "CANCELLED"
         return None
 
@@ -791,62 +793,75 @@ class RuntimeStore:
                     return False
                 if not self._has_cancel_request(task) and task["status"] != "cancelling":
                     return False
-                reason = self._cancel_reason(task)
-                if task["status"] == "running":
-                    await conn.execute(
-                        """
-                        UPDATE runtime.tasks
-                        SET status = 'cancelling',
-                            cancel_requested_at = COALESCE(cancel_requested_at, now()),
-                            updated_at = now(), version = version + 1
-                        WHERE id = $1::uuid
-                        """,
-                        lease.task_id,
-                    )
-                    await self._append_event(
-                        conn,
-                        task_id=lease.task_id,
-                        attempt_id=lease.attempt_id,
-                        event_type="task.cancelling",
-                        payload={"reason": reason},
-                    )
-                await conn.execute(
-                    """
-                    UPDATE runtime.tasks
-                    SET status = 'cancelled',
-                        cancel_requested_at = COALESCE(cancel_requested_at, now()),
-                        completed_at = now(), error_code = NULL,
-                        error_message = NULL, next_retry_at = NULL,
-                        updated_at = now(), version = version + 1
-                    WHERE id = $1::uuid
-                    """,
-                    lease.task_id,
-                )
-                await conn.execute(
-                    """
-                    UPDATE runtime.task_attempts
-                    SET status = 'abandoned', finished_at = now(),
-                        error_code = 'CANCELLED',
-                        error_detail = 'task cancelled by owner'
-                    WHERE id = $1::uuid AND status = 'running'
-                    """,
-                    lease.attempt_id,
-                )
-                await self._append_event(
-                    conn,
-                    task_id=lease.task_id,
-                    attempt_id=lease.attempt_id,
-                    event_type="task.cancelled",
-                    payload={"reason": reason},
-                )
-                return True
+                return await self._finalize_cancellation_locked(conn, lease, task)
+
+    async def _finalize_cancellation_locked(
+        self,
+        conn: asyncpg.Connection,
+        lease: AttemptLease,
+        task: asyncpg.Record,
+    ) -> bool:
+        """Finalize cancellation while the caller holds Task/event locks."""
+        reason = self._cancel_reason(task)
+        if task["status"] == "running":
+            await conn.execute(
+                """
+                UPDATE runtime.tasks
+                SET status = 'cancelling',
+                    cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                    updated_at = now(), version = version + 1
+                WHERE id = $1::uuid
+                """,
+                lease.task_id,
+            )
+            await self._append_event(
+                conn,
+                task_id=lease.task_id,
+                attempt_id=lease.attempt_id,
+                event_type="task.cancelling",
+                payload={"reason": reason},
+            )
+        await conn.execute(
+            """
+            UPDATE runtime.tasks
+            SET status = 'cancelled',
+                cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                completed_at = now(), error_code = NULL,
+                error_message = NULL, next_retry_at = NULL,
+                updated_at = now(), version = version + 1
+            WHERE id = $1::uuid
+            """,
+            lease.task_id,
+        )
+        await conn.execute(
+            """
+            UPDATE runtime.task_attempts
+            SET status = 'abandoned', finished_at = now(),
+                error_code = 'CANCELLED',
+                error_detail = 'task cancelled by owner'
+            WHERE id = $1::uuid AND status = 'running'
+            """,
+            lease.attempt_id,
+        )
+        await self._append_event(
+            conn,
+            task_id=lease.task_id,
+            attempt_id=lease.attempt_id,
+            event_type="task.cancelled",
+            payload={"reason": reason},
+        )
+        return True
 
     async def expire_task(self, lease: AttemptLease) -> bool:
         """Fenced terminal transition to ``failed(DEADLINE_EXCEEDED)``."""
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 task = await self._lock_live_attempt(conn, lease)
-                if task["status"] in TERMINAL_TASK_STATUSES or not task["expired"]:
+                if task["status"] in TERMINAL_TASK_STATUSES:
+                    return False
+                if self._has_cancel_request(task):
+                    return await self._finalize_cancellation_locked(conn, lease, task)
+                if not task["expired"]:
                     return False
                 await conn.execute(
                     """
@@ -923,13 +938,24 @@ class RuntimeStore:
                     if task is None or task["status"] not in ACTIVE_TASK_STATUSES:
                         continue
                     await self._lock_events(conn, task_id)
-                    cancelled_event = await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM runtime.task_events "
-                        "WHERE task_id = $1::uuid "
-                        "AND event_type = 'task.cancelled')",
+                    cancel_state = await conn.fetchrow(
+                        """
+                        SELECT
+                            EXISTS (
+                                SELECT 1 FROM runtime.task_events
+                                WHERE task_id = $1::uuid
+                                  AND event_type = 'task.cancelled'
+                            ) AS cancelled_event,
+                            EXISTS (
+                                SELECT 1 FROM runtime.task_events
+                                WHERE task_id = $1::uuid
+                                  AND event_type = $2
+                            ) AS cancel_requested
+                        """,
                         task_id,
+                        CANCEL_REQUEST_EVENT,
                     )
-                    if cancelled_event:
+                    if cancel_state["cancelled_event"]:
                         # Cancellation committed first; materialize it instead
                         # of appending a second terminal event.
                         await conn.execute(
@@ -954,6 +980,57 @@ class RuntimeStore:
                             WHERE task_id = $1::uuid AND status = 'running'
                             """,
                             task_id,
+                        )
+                        handled += 1
+                        continue
+                    if cancel_state["cancel_requested"]:
+                        task_state = await conn.fetchrow(
+                            """
+                            SELECT status, cancel_requested_at,
+                                   (deadline_at IS NOT NULL AND deadline_at <= now())
+                                       AS expired,
+                                   true AS cancel_event,
+                                   (SELECT event.payload_json
+                                    FROM runtime.task_events AS event
+                                    WHERE event.task_id = runtime.tasks.id
+                                      AND event.event_type = $2
+                                    ORDER BY event.task_event_seq
+                                    LIMIT 1) AS cancel_payload
+                            FROM runtime.tasks
+                            WHERE id = $1::uuid
+                            """,
+                            task_id,
+                            CANCEL_REQUEST_EVENT,
+                        )
+                        reason = self._cancel_reason(task_state)
+                        await conn.execute(
+                            """
+                            UPDATE runtime.tasks
+                            SET status = 'cancelled',
+                                cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                                completed_at = now(), error_code = NULL,
+                                error_message = NULL, next_retry_at = NULL,
+                                updated_at = now(), version = version + 1
+                            WHERE id = $1::uuid
+                            """,
+                            task_id,
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE runtime.task_attempts
+                            SET status = 'abandoned',
+                                finished_at = COALESCE(finished_at, now()),
+                                error_code = COALESCE(error_code, 'CANCELLED')
+                            WHERE task_id = $1::uuid AND status = 'running'
+                            """,
+                            task_id,
+                        )
+                        await self._append_event(
+                            conn,
+                            task_id=task_id,
+                            attempt_id=None,
+                            event_type='task.cancelled',
+                            payload={"reason": reason, "source": "scanner"},
                         )
                         handled += 1
                         continue
@@ -1332,14 +1409,14 @@ class RuntimeStore:
         task = await self._lock_task_state(conn, lease.task_id)
         if task is None:
             raise LeaseLostError("task no longer exists")
-        if task["expired"]:
-            raise TaskNotRunningError("DEADLINE_EXCEEDED", "task deadline has passed")
         if (
             task["status"] == "cancelling"
             or task["cancel_requested_at"] is not None
             or task["cancel_event"]
         ):
             raise TaskNotRunningError("CANCELLED", "task cancellation was requested")
+        if task["expired"]:
+            raise TaskNotRunningError("DEADLINE_EXCEEDED", "task deadline has passed")
         if task["status"] != "running":
             raise TaskNotRunningError(
                 "TASK_NOT_RUNNING", f"task status is {task['status']}"
