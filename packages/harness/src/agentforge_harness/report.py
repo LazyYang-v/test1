@@ -13,6 +13,20 @@ from typing import Any, Sequence
 
 REPORT_VERSION = "1.0"
 
+# Platform-owned limitations. They are deterministic consequences of the
+# evidence annotations, not model prose, so a report cannot omit them.
+PLATFORM_LIMITATIONS = {
+    "ZERO_BASELINE": (
+        "ZERO_BASELINE: the previous comparison period had no paid GMV, so "
+        "change_rate is undefined."
+    ),
+    "DATA_INSUFFICIENT": (
+        "DATA_INSUFFICIENT: the current period has no paid orders in the "
+        "authorized region scope, so the metric is zero and the comparison may "
+        "not be meaningful."
+    ),
+}
+
 _REPORT_KEYS = {
     "summary",
     "metrics",
@@ -58,6 +72,7 @@ class Evidence:
     absolute_change: Decimal
     change_rate: Decimal | None
     row_count: int = 1
+    annotations: tuple[str, ...] = ()
 
 
 def _money(value: Decimal) -> str:
@@ -135,13 +150,19 @@ def build_report(
     referenced = {metric["evidence_id"] for metric in metrics}
     for finding in compose["findings"]:
         referenced.update(finding["evidence_ids"])
+    limitations = list(compose["limitations"])
+    for evidence in evidences:
+        for annotation in evidence.annotations:
+            text = PLATFORM_LIMITATIONS.get(annotation)
+            if text is not None and text not in limitations:
+                limitations.append(text)
     return {
         "summary": compose["summary"],
         "metrics": metrics,
         "findings": compose["findings"],
         "hypotheses": compose["hypotheses"],
         "recommendations": compose["recommendations"],
-        "limitations": compose["limitations"],
+        "limitations": limitations,
         "evidence_ids": sorted(referenced),
         "report_version": report_version,
     }

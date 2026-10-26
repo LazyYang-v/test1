@@ -51,7 +51,7 @@ def _compose(**overrides) -> dict:
             {"text": "A marketing pause may explain the decline.", "status": "unverified"}
         ],
         "recommendations": ["Review campaign coverage for the window."],
-        "limitations": ["This P0 metric is a deterministic stub, not live SQL."],
+        "limitations": ["This analysis covers only the authorized region scope."],
     }
     content.update(overrides)
     return content
@@ -59,6 +59,38 @@ def _compose(**overrides) -> dict:
 
 def _valid_report() -> dict:
     return build_report(_compose(), [_evidence()])
+
+
+def test_build_report_adds_platform_limitations_from_evidence_annotations():
+    zero_baseline = _evidence(annotations=("ZERO_BASELINE",))
+    report = build_report(_compose(), [zero_baseline])
+    assert any(
+        limitation.startswith("ZERO_BASELINE:")
+        for limitation in report["limitations"]
+    )
+    validate_report(
+        report,
+        task_id=TASK_ID,
+        data_snapshot_id=SNAPSHOT_ID,
+        evidences=[zero_baseline],
+    )
+
+
+def test_build_report_annotates_data_insufficiency_once():
+    evidence = _evidence(
+        current_value=Decimal("0.00"),
+        absolute_change=Decimal("-70000.00"),
+        change_rate=Decimal("-1.0000"),
+        row_count=0,
+        annotations=("DATA_INSUFFICIENT",),
+    )
+    report = build_report(_compose(), [evidence, evidence])
+    platform = [
+        limitation
+        for limitation in report["limitations"]
+        if limitation.startswith("DATA_INSUFFICIENT:")
+    ]
+    assert len(platform) == 1
 
 
 def test_build_report_uses_platform_values_and_version():

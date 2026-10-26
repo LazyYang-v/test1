@@ -6,10 +6,14 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Any
 
 import asyncpg
+from agentforge_core.business_dataset import write_dataset
+from agentforge_core.business_loader import load_dataset
 from agentforge_core.schema_version import SCHEMA_VERSION  # noqa: F401
 from httpx import ASGITransport, AsyncClient
 
@@ -29,22 +33,31 @@ FROZEN_DATE_RANGE = {
 }
 
 
+_FROZEN_DATASET_DIR: tempfile.TemporaryDirectory[str] | None = None
+
+
+def _frozen_dataset_path() -> Path:
+    """Build the canonical frozen dataset once per test process."""
+    global _FROZEN_DATASET_DIR
+    if _FROZEN_DATASET_DIR is None:
+        _FROZEN_DATASET_DIR = tempfile.TemporaryDirectory(
+            prefix="agentforge-frozen-dataset-"
+        )
+        destination = Path(_FROZEN_DATASET_DIR.name) / "business.jsonl"
+        snapshot_id = write_dataset(destination)
+        assert snapshot_id == SNAPSHOT_ID
+    return Path(_FROZEN_DATASET_DIR.name) / "business.jsonl"
+
+
 async def complete_dataset_load(db: dict) -> None:
-    """The deterministic metrics stub does not read business rows in ticket 06."""
+    """Load the real frozen dataset through the canonical loader.
+
+    Ticket 07 executes real SQL over ``business.gmv_v1``, so the worker seam
+    must run against real business rows rather than a state-only fixture.
+    """
     conn = await asyncpg.connect(db["role_dsn"]("migrator"))
     try:
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE business.dataset_loads SET status = 'loading' "
-                "WHERE data_snapshot_id = $1 AND status = 'pending'",
-                SNAPSHOT_ID,
-            )
-            await conn.execute(
-                "UPDATE business.dataset_loads "
-                "SET status = 'complete', completed_at = now() "
-                "WHERE data_snapshot_id = $1 AND status = 'loading'",
-                SNAPSHOT_ID,
-            )
+        assert await load_dataset(conn, _frozen_dataset_path()) == SNAPSHOT_ID
     finally:
         await conn.close()
 
@@ -166,6 +179,7 @@ def create_task_body(
     *,
     region_codes: list[str] | None = None,
     question: str = "Explain the change in CN_EAST GMV from the previous period",
+    date_range: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "agent_key": agent_key,
@@ -173,7 +187,7 @@ def create_task_body(
         "input": {
             "question": question,
             "region_codes": region_codes or ["CN_EAST"],
-            "date_range": dict(FROZEN_DATE_RANGE),
+            "date_range": dict(date_range or FROZEN_DATE_RANGE),
             "compare_mode": "previous_period",
         },
         "execution": {"timeout_seconds": 60, "max_attempts": 1},
@@ -186,6 +200,7 @@ async def create_task_via_api(
     *,
     idempotency_key: str | None = None,
     region_codes: list[str] | None = None,
+    date_range: dict[str, str] | None = None,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {token()}",
@@ -196,7 +211,9 @@ async def create_task_via_api(
     ) as client:
         response = await client.post(
             "/api/v1/tasks",
-            json=create_task_body(agent_key, region_codes=region_codes),
+            json=create_task_body(
+                agent_key, region_codes=region_codes, date_range=date_range
+            ),
             headers=headers,
         )
     assert response.status_code == 202, response.text
@@ -301,7 +318,7 @@ async def fetch_evidences(db: dict, task_id: str) -> list[dict[str, Any]]:
             SELECT id::text AS evidence_id, task_id::text AS task_id,
                    data_snapshot_id, metric_key, metric_version, unit,
                    current_value, previous_value, absolute_change, change_rate,
-                   row_count
+                   row_count, query_plan_json, result_json, result_set_hash
             FROM harness.evidences WHERE task_id = $1::uuid
             ORDER BY created_at, id
             """,
@@ -309,7 +326,16 @@ async def fetch_evidences(db: dict, task_id: str) -> list[dict[str, Any]]:
         )
     finally:
         await conn.close()
-    return [dict(row) for row in rows]
+    return [
+        {
+            **dict(row),
+            "data_snapshot_id": row["data_snapshot_id"].strip(),
+            "query_plan": json.loads(row["query_plan_json"]),
+            "result": json.loads(row["result_json"]),
+            "result_set_hash": row["result_set_hash"].strip(),
+        }
+        for row in rows
+    ]
 
 
 async def fetch_audits(db: dict, *, action: str) -> list[dict[str, Any]]:

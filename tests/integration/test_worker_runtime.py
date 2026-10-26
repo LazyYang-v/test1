@@ -39,6 +39,7 @@ async def _pool(db: dict, *, size: int = 5) -> asyncpg.Pool:
 def _settings(db: dict, **overrides) -> WorkerSettings:
     values = {
         "worker_db_dsn": db["role_dsn"]("worker"),
+        "business_ro_db_dsn": db["role_dsn"]("business_ro"),
         "worker_id": "worker-test",
         "heartbeat_interval_seconds": 0.05,
         "lease_seconds": 0.6,

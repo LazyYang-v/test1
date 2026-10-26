@@ -204,7 +204,8 @@ def _default_compose(evidence_ids: list[str]) -> dict[str, Any]:
             "Compare the window with the live campaign calendar.",
         ],
         "limitations": [
-            "P0 uses a deterministic metrics stub; ticket 07 adds the real SQL path.",
+            "The analysis is limited to the authorized region scope and the "
+            "frozen data snapshot.",
         ],
     }
 
