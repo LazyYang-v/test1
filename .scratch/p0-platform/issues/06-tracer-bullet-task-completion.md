@@ -4,16 +4,16 @@
 
 **Blocked by:** 05
 
-**Status:** claimed
+**Status:** resolved
 
-- [ ] Worker 以 SKIP LOCKED 认领；两 Worker 并发领取只有一个有效租约（RT-04）
-- [ ] 心跳按间隔续期租约（RT-05）；Attempt 记录 worker/lease_token/fencing_epoch
-- [ ] 四节点顺序执行；每步确认在事务内验证租约后写 step_executions（稳定 step_key，如 plan_metrics:0）+ task_event
-- [ ] Fake Model 输出可脚本化；非法 JSON 经校验有限修复重试、超预算失败而非默认结论（HS-02）
-- [ ] Tool Gateway 骨架：工具版本验证、输入 Schema 校验、未绑定工具拒绝（HS-03）、非法参数拒绝（HS-04）、审计与 Trace 记录
-- [ ] 结果符合报告 Schema：findings 引用有效证据 ID、hypotheses 标注待验证、limitations 齐全；validate_report 拒绝引用不存在证据（BA-10 结构）
-- [ ] 任务 → completed，result_json 与 completed_at 持久化，事件序完整可读
-- [ ] 数据库事务短小：节点执行期间不持有 Task 行锁
+- [x] Worker 以 SKIP LOCKED 认领；两 Worker 并发领取只有一个有效租约（RT-04）
+- [x] 心跳按间隔续期租约（RT-05）；Attempt 记录 worker/lease_token/fencing_epoch
+- [x] 四节点顺序执行；每步确认在事务内验证租约后写 step_executions（稳定 step_key，如 plan_metrics:0）+ task_event
+- [x] Fake Model 输出可脚本化；非法 JSON 经校验有限修复重试、超预算失败而非默认结论（HS-02）
+- [x] Tool Gateway 骨架：工具版本验证、输入 Schema 校验、未绑定工具拒绝（HS-03）、非法参数拒绝（HS-04）、审计与 Trace 记录
+- [x] 结果符合报告 Schema：findings 引用有效证据 ID、hypotheses 标注待验证、limitations 齐全；validate_report 拒绝引用不存在证据（BA-10 结构）
+- [x] 任务 → completed，result_json 与 completed_at 持久化，事件序完整可读
+- [x] 数据库事务短小：节点执行期间不持有 Task 行锁
 
 ## Comments
 
@@ -30,3 +30,11 @@
 - Evidence: `POST /api/v1/tasks` -> real worker -> `GET /api/v1/tasks/{id}` completed with a schema-valid report (CN_EAST 2025-03-31..2025-04-07: 57400.00 vs 70000.00, -12600.00, -0.1800). Persisted events are contiguous seq 1-7 with four ordered `step.completed` rows for `plan_metrics:0`, `execute_metrics:0`, `compose_analysis:0`, `validate_report:0`.
 - Negative paths: two concurrent claims produce one attempt; heartbeat renewal observed during a blocked model call; expired/fenced confirmation rejected with no step/event; invalid JSON exhausts three bounded attempts then fails `MODEL_OUTPUT_INVALID` with a failed step and no evidence/completion; unbound tool and invalid arguments fail closed with denied `tool.invocation` audit; missing and foreign evidence fail `validate_report`; no Task tuple lock or idle-in-transaction session is observed while the model is blocked.
 - Status left `claimed`; integration verification and resolution remain with the merger.
+
+## Resolution
+
+Merged `ticket/06-tracer-bullet-task-completion` (tip `a1a7c08`) into `integration/p0` as merge commit `0da5a80983adbf8ff6fc1e49c3da6a45821b0f13` (no-ff, no conflicts), including migration `0008_runtime_harness_evidence.sql`. Tickets 07-16, the live DeepSeek provider, and the Release Gate are not claimed as done.
+
+### Post-merge Verification (2026-10-26)
+
+- Full suite: `uv run pytest -q --tb=short` -> `348 passed in 261.58s (0:04:21)` on the continuous 0001-0008 sequence with real Docker PostgreSQL; exit code 0. Merge commit `0da5a80983adbf8ff6fc1e49c3da6a45821b0f13`; `git diff --check HEAD^1...HEAD` -> clean.
