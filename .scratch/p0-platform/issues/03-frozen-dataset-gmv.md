@@ -15,4 +15,6 @@
 
 **Resolution:** Merged into `integration/p0` at `3dcbf8e`.
 
-**Verification:** Full Offline + PostgreSQL Integration suite passed: 41 passed. `data_snapshot_id`: `e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8`.
+**Verification:** Original acceptance passed: Full Offline + PostgreSQL Integration suite passed: 41 passed. `data_snapshot_id`: `e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8`.
+
+**Integrity follow-up:** Commit `51f7b97` adds serialized initial snapshot loading, hashes the exact bytes parsed, makes loaded business rows immutable, and rejects gapped migration ledgers. Full PostgreSQL + Offline suite passed after migrations 0001–0005 were integrated: 50 passed.
