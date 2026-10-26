@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from datetime import UTC, date, datetime
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import asyncpg
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -32,28 +34,43 @@ def _json_value(value: Any) -> Any:
 class DateRange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    start: datetime
-    end: datetime
+    start: date
+    end_exclusive: date
+    timezone: str = Field(min_length=1, max_length=128)
 
-    @field_validator("start", "end")
+    @field_validator("start", "end_exclusive", mode="before")
     @classmethod
-    def normalize_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("date range values must include a timezone")
-        return value.astimezone(UTC)
+    def require_iso_date(cls, value: Any) -> date:
+        if not isinstance(value, str):
+            raise ValueError("date range values must be ISO dates")
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError("date range values must use YYYY-MM-DD")
+        return parsed
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("timezone must name an IANA timezone") from None
+        return value
 
     @model_validator(mode="after")
     def validate_range(self):
-        if self.start >= self.end:
-            raise ValueError("date range start must be before end")
-        if self.end - self.start > timedelta(days=90):
-            raise ValueError("date range cannot exceed 90 days")
+        duration = (self.end_exclusive - self.start).days
+        if duration <= 0:
+            raise ValueError("end_exclusive must be after start")
+        if duration > 90:
+            raise ValueError("date range cannot exceed 90 calendar days")
         return self
 
     def canonical_json(self) -> dict[str, str]:
         return {
-            "start": self.start.isoformat(timespec="microseconds"),
-            "end": self.end.isoformat(timespec="microseconds"),
+            "start": self.start.isoformat(),
+            "end_exclusive": self.end_exclusive.isoformat(),
+            "timezone": self.timezone,
         }
 
 
@@ -63,7 +80,7 @@ class TaskInput(BaseModel):
     question: str = Field(min_length=1, max_length=10000)
     region_codes: list[str] = Field(min_length=1, max_length=100)
     date_range: DateRange
-    compare_mode: str | None = Field(default=None, max_length=64)
+    compare_mode: Literal["previous_period"] = "previous_period"
 
     @field_validator("question")
     @classmethod
@@ -82,16 +99,6 @@ class TaskInput(BaseModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("region codes must not contain duplicates")
         return sorted(normalized)
-
-    @field_validator("compare_mode")
-    @classmethod
-    def normalize_compare_mode(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        value = value.strip()
-        if not value:
-            raise ValueError("compare_mode must not be blank")
-        return value
 
     def canonical_json(self) -> dict[str, Any]:
         return {
@@ -123,7 +130,7 @@ class CreateTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_key: str = Field(min_length=1, max_length=128)
-    task_type: str = Field(min_length=1, max_length=128)
+    task_type: Literal["business_analysis"]
     input: TaskInput
     execution: ExecutionOptions = Field(default_factory=ExecutionOptions)
 
@@ -144,11 +151,18 @@ class CreateTaskRequest(BaseModel):
         }
 
 
-def _task_response(task_id: str) -> dict[str, Any]:
+def _task_response(
+    task_id: str, *, agent_version: str, created_at: datetime
+) -> dict[str, Any]:
     return {
         "task_id": task_id,
         "status": "queued",
-        "links": {"self": f"/api/v1/tasks/{task_id}"},
+        "agent_version": agent_version,
+        "created_at": created_at.isoformat(),
+        "links": {
+            "self": f"/api/v1/tasks/{task_id}",
+            "events": f"/api/v1/tasks/{task_id}/events",
+        },
     }
 
 
@@ -217,12 +231,12 @@ async def create_task(
                     raise ApiError(503, "IDEMPOTENCY_RETRY", "Retry task creation", retryable=True)
                 return JSONResponse(
                     status_code=existing["response_status"],
-                    content=_json_value(existing["response_json"]),
+                    content=json.loads(_canonical(_json_value(existing["response_json"]))),
                 )
 
             agent = await conn.fetchrow(
                 """
-                SELECT id::text AS id FROM registry.agent_versions
+                SELECT id::text AS id, version FROM registry.agent_versions
                 WHERE agent_key = $1 AND status = 'published'
                 ORDER BY published_at DESC, created_at DESC, version DESC LIMIT 1
                 """,
@@ -290,28 +304,36 @@ async def create_task(
                 for grant in grants
             ]
             normalized_input = body.input.canonical_json()
-            await conn.execute(
-                """
-                INSERT INTO runtime.tasks
-                    (id, owner_user_id, agent_version_id, task_type, status,
-                     input_json, input_hash, region_scope_json, authorization_snapshot,
-                     data_snapshot_id, max_attempts, deadline_at)
-                VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
-                        $7::jsonb, $8::jsonb, $9, $10,
-                        now() + ($11 * interval '1 second'))
-                """,
-                task_id,
-                principal["id"],
-                agent["id"],
-                body.task_type,
-                _canonical(normalized_input),
-                _hash(normalized_input),
-                _canonical(body.input.region_codes),
-                _canonical(authorization_snapshot),
-                snapshot["data_snapshot_id"],
-                body.execution.max_attempts,
-                body.execution.timeout_seconds,
-            )
+            try:
+                created_at = await conn.fetchval(
+                    """
+                    INSERT INTO runtime.tasks
+                        (id, owner_user_id, agent_version_id, task_type, status,
+                         input_json, input_hash, region_scope_json, authorization_snapshot,
+                         data_snapshot_id, max_attempts, deadline_at)
+                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
+                            $7::jsonb, $8::jsonb, $9, $10,
+                            now() + ($11 * interval '1 second'))
+                    RETURNING created_at
+                    """,
+                    task_id,
+                    principal["id"],
+                    agent["id"],
+                    body.task_type,
+                    _canonical(normalized_input),
+                    _hash(normalized_input),
+                    _canonical(body.input.region_codes),
+                    _canonical(authorization_snapshot),
+                    snapshot["data_snapshot_id"],
+                    body.execution.max_attempts,
+                    body.execution.timeout_seconds,
+                )
+            except asyncpg.CheckViolationError as error:
+                if error.constraint_name != "tasks_agent_must_be_published":
+                    raise
+                raise ApiError(
+                    400, "INVALID_REQUEST", "agent_key does not resolve to a published Agent"
+                ) from None
             await conn.execute(
                 """
                 INSERT INTO runtime.task_events (task_id, task_event_seq, event_type,
@@ -340,7 +362,9 @@ async def create_task(
                 }),
                 request.state.request_id,
             )
-            response = _task_response(task_id)
+            response = _task_response(
+                task_id, agent_version=agent["version"], created_at=created_at
+            )
             await conn.execute(
                 """
                 UPDATE runtime.idempotency_records
@@ -352,7 +376,7 @@ async def create_task(
                 task_id,
                 _canonical(response),
             )
-    return JSONResponse(status_code=202, content=response)
+    return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 
 @router.get("")
@@ -442,4 +466,3 @@ async def get_task(
         "updated_at": result["updated_at"],
         "completed_at": result["completed_at"],
     }
-

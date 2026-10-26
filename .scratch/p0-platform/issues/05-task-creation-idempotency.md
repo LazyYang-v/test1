@@ -4,7 +4,9 @@
 
 **Blocked by:** 02、03、04
 
-**Status:** resolved
+**Status:** claimed
+
+Integration: pending integration/p0 merge; contract and concurrency review corrections in progress.
 
 - [x] 合法请求 202 + task_id + links；Task 状态 queued，task.created 事件落库
 - [x] agent_key 解析不到已发布版本 → 拒绝；region_codes 非当前授权子集 → 403 REGION_ACCESS_DENIED；日期范围超 90 天 → 拒绝

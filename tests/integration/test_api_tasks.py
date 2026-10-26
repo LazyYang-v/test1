@@ -24,7 +24,7 @@ PROFILE_ID = "0192a3b4-c5d6-7e8f-9012-3456789abd01"
 AGENT_VERSION_ID = "0192a3b4-c5d6-7e8f-9012-3456789abd02"
 
 
-async def _seed_user_and_agent(migrated_db, *, grant_regions=("east",)):
+async def _seed_user_and_agent(migrated_db, *, grant_regions=("CN_EAST",)):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
@@ -98,13 +98,14 @@ def _app(migrated_db):
 def _request_body(**overrides):
     body = {
         "agent_key": "sales-report",
-        "task_type": "analysis",
+        "task_type": "business_analysis",
         "input": {
-            "question": "Summarize east region GMV",
-            "region_codes": ["east"],
+            "question": "Explain the change in CN_EAST GMV from the previous period",
+            "region_codes": ["CN_EAST"],
             "date_range": {
-                "start": "2026-10-01T00:00:00Z",
-                "end": "2026-10-08T00:00:00Z",
+                "start": "2025-03-31",
+                "end_exclusive": "2025-04-07",
+                "timezone": "UTC",
             },
             "compare_mode": "previous_period",
         },
@@ -112,6 +113,66 @@ def _request_body(**overrides):
     }
     body.update(overrides)
     return body
+
+
+@pytest.fixture
+async def seeded_tasks_db(migrated_db, tmp_path):
+    await _seed_user_and_agent(migrated_db)
+    dataset_path = tmp_path / "business.jsonl"
+    write_dataset(dataset_path)
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
+    try:
+        await load_dataset(conn, dataset_path)
+    finally:
+        await conn.close()
+    return migrated_db
+
+
+async def _install_task_insert_barrier(conn):
+    # The zz prefix places this after the production Agent publication guard.
+    await conn.execute(
+        """
+        CREATE FUNCTION runtime.test_block_task_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(50005);
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER zz_test_block_task_insert
+        BEFORE INSERT ON runtime.tasks
+        FOR EACH ROW EXECUTE FUNCTION runtime.test_block_task_insert()
+        """
+    )
+
+
+async def _wait_for_blocked_statement(conn, statement: str, blocked_by: int) -> int:
+    try:
+        async with asyncio.timeout(10):
+            while True:
+                pid = await conn.fetchval(
+                    """
+                    SELECT pid FROM pg_stat_activity
+                    WHERE datname = current_database() AND state = 'active'
+                      AND wait_event_type = 'Lock' AND query LIKE $1
+                      AND $2::integer = ANY(pg_blocking_pids(pid))
+                    """,
+                    f"%{statement}%", blocked_by,
+                )
+                if pid is not None:
+                    return pid
+                await asyncio.sleep(0.01)
+    except TimeoutError:
+        raise AssertionError(
+            f"No session executing {statement!r} was blocked by session {blocked_by}"
+        ) from None
+
+
+async def _cancel_pending(*tasks):
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+    await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
 
 
 async def test_task_creation_returns_accepted_and_persists_task_and_created_event(
@@ -142,7 +203,12 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
     payload = response.json()
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
-    assert payload["links"]["self"] == f"/api/v1/tasks/{task_id}"
+    assert payload["links"] == {
+        "self": f"/api/v1/tasks/{task_id}",
+        "events": f"/api/v1/tasks/{task_id}/events",
+    }
+    assert payload["agent_version"] == "1.0.0"
+    assert datetime.fromisoformat(payload["created_at"]).tzinfo is not None
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
@@ -151,7 +217,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
             SELECT owner_user_id::text AS owner_user_id,
                    agent_version_id::text AS agent_version_id, status,
                    input_json, region_scope_json, authorization_snapshot,
-                   data_snapshot_id, current_attempt_no
+                   data_snapshot_id, current_attempt_no, created_at
             FROM runtime.tasks WHERE id = $1::uuid
             """,
             task_id,
@@ -176,9 +242,9 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
     assert task["owner_user_id"] == USER_ID
     assert task["agent_version_id"] == AGENT_VERSION_ID
     assert task["status"] == "queued"
-    assert task["region_scope_json"] == '["east"]'
+    assert task["region_scope_json"] == '["CN_EAST"]'
     assert json.loads(task["authorization_snapshot"]) == [
-        {"region_code": "east", "permission": "read"}
+        {"region_code": "CN_EAST", "permission": "read"}
     ]
     assert event["task_event_seq"] == 1
     assert event["event_type"] == "task.created"
@@ -192,6 +258,13 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         "e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8"
     )
     assert task["current_attempt_no"] == 0
+    assert task["created_at"] == datetime.fromisoformat(payload["created_at"])
+    assert json.loads(task["input_json"])["compare_mode"] == "previous_period"
+    assert json.loads(task["input_json"])["date_range"] == {
+        "start": "2025-03-31",
+        "end_exclusive": "2025-04-07",
+        "timezone": "UTC",
+    }
 
 
 async def test_task_creation_atomicity_and_response_replay(
@@ -284,7 +357,7 @@ async def test_task_creation_atomicity_and_response_replay(
 async def test_same_key_replays_normalized_request_even_after_grant_revocation(
     migrated_db, tmp_path
 ):
-    await _seed_user_and_agent(migrated_db)
+    await _seed_user_and_agent(migrated_db, grant_regions=("CN_EAST", "CN_NORTH"))
     dataset_path = tmp_path / "business.jsonl"
     write_dataset(dataset_path)
     migrator = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
@@ -297,9 +370,13 @@ async def test_same_key_replays_normalized_request_even_after_grant_revocation(
         "Authorization": f"Bearer {_token()}",
         "Idempotency-Key": "normalized-replay-001",
     }
+    original = _request_body()
+    original.pop("execution")
+    original["input"].pop("compare_mode")
+    original["input"]["region_codes"] = ["CN_NORTH", "CN_EAST"]
     app = _app(migrated_db)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-        first = await client.post("/api/v1/tasks", json=_request_body(), headers=headers)
+        first = await client.post("/api/v1/tasks", json=original, headers=headers)
 
         migrator = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
         try:
@@ -313,12 +390,9 @@ async def test_same_key_replays_normalized_request_even_after_grant_revocation(
         equivalent = _request_body(
             input={
                 **_request_body()["input"],
-                "region_codes": [" east "],
-                "date_range": {
-                    "start": "2026-10-01T08:00:00+08:00",
-                    "end": "2026-10-08T08:00:00+08:00",
-                },
-            }
+                "region_codes": [" CN_EAST ", "CN_NORTH"],
+            },
+            execution={"max_attempts": 3, "timeout_seconds": 300},
         )
         replay = await client.post("/api/v1/tasks", json=equivalent, headers=headers)
 
@@ -549,11 +623,143 @@ async def test_api_role_can_only_read_snapshot_metadata_and_cannot_mutate_tasks(
             )
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute("DELETE FROM runtime.task_events WHERE false")
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.execute("UPDATE registry.agent_versions SET status = 'retired' WHERE false")
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.execute("INSERT INTO registry.agent_versions DEFAULT VALUES")
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.execute("SELECT runtime.require_published_task_agent()")
+        assert await conn.fetchval(
+            "SELECT has_function_privilege(current_user, "
+            "'runtime.require_published_task_agent()', 'EXECUTE')"
+        ) is False
     finally:
         await conn.close()
     assert snapshot_id.strip() == (
         "e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8"
     )
+
+
+async def test_approved_date_only_request_preserves_iana_timezone(seeded_tasks_db):
+    date_range = {
+        "start": "2026-10-19",
+        "end_exclusive": "2026-10-26",
+        "timezone": "Asia/Shanghai",
+    }
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/v1/tasks",
+            json=_request_body(input={**_request_body()["input"], "date_range": date_range}),
+            headers={"Authorization": f"Bearer {_token()}", "Idempotency-Key": "approved-example"},
+        )
+    assert response.status_code == 202
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        persisted_input = await conn.fetchval(
+            "SELECT input_json FROM runtime.tasks WHERE id = $1::uuid",
+            response.json()["task_id"],
+        )
+    finally:
+        await conn.close()
+    assert json.loads(persisted_input)["date_range"] == date_range
+
+
+async def test_ninety_calendar_days_across_dst_preserves_timezone(seeded_tasks_db):
+    db = seeded_tasks_db
+    date_range = {
+        "start": "2026-08-18",
+        "end_exclusive": "2026-11-16",
+        "timezone": "America/New_York",
+    }
+    headers = {"Authorization": f"Bearer {_token()}", "Idempotency-Key": "calendar-day-limit"}
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/v1/tasks",
+            json=_request_body(input={**_request_body()["input"], "date_range": date_range}),
+            headers=headers,
+        )
+    assert response.status_code == 202
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        persisted_input = await conn.fetchval(
+            "SELECT input_json FROM runtime.tasks WHERE id = $1::uuid",
+            response.json()["task_id"],
+        )
+    finally:
+        await conn.close()
+    assert json.loads(persisted_input)["date_range"] == date_range
+
+
+@pytest.mark.parametrize(
+    "date_range",
+    [
+        {"start": "2026-10-19", "end_exclusive": "2026-10-26", "timezone": "Invalid/Timezone"},
+        {"start": "2026-10-19", "end_exclusive": "2026-10-26", "timezone": "+08:00"},
+        {"start": "2026-10-19", "end_exclusive": "2026-10-19", "timezone": "Asia/Shanghai"},
+        {"start": "2026-10-26", "end_exclusive": "2026-10-19", "timezone": "Asia/Shanghai"},
+        {"start": "2026-01-01", "end_exclusive": "2026-04-02", "timezone": "Asia/Shanghai"},
+        {"start": "2026-10-19T00:00:00+08:00", "end_exclusive": "2026-10-26", "timezone": "Asia/Shanghai"},
+        {"start": "2026-10-19", "end_exclusive": "2026-10-26"},
+    ],
+)
+async def test_invalid_calendar_date_ranges_are_rejected(migrated_db, date_range):
+    await _seed_user_and_agent(migrated_db)
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(migrated_db)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/v1/tasks",
+            json=_request_body(input={**_request_body()["input"], "date_range": date_range}),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "invalid-calendar-range",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"
+
+
+@pytest.mark.parametrize("compare_mode", [None, "", "year_over_year", "free_sql"])
+async def test_unsupported_comparison_is_rejected(migrated_db, compare_mode):
+    await _seed_user_and_agent(migrated_db)
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(migrated_db)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/v1/tasks",
+            json=_request_body(input={**_request_body()["input"], "compare_mode": compare_mode}),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "unsupported-comparison",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"
+    assert response.json()["error"]["details"]["fields"] == ["body.input.compare_mode"]
+
+
+@pytest.mark.parametrize("task_type", ["analysis", "sql", "shell", "python"])
+async def test_unsupported_task_type_is_rejected(migrated_db, task_type):
+    await _seed_user_and_agent(migrated_db)
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(migrated_db)), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            "/api/v1/tasks",
+            json=_request_body(task_type=task_type),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "unsupported-task-type",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"
+    assert response.json()["error"]["details"]["fields"] == ["body.task_type"]
 
 
 async def test_region_denial_and_invalid_date_leave_no_task_or_key(migrated_db):
@@ -578,8 +784,9 @@ async def test_region_denial_and_invalid_date_leave_no_task_or_key(migrated_db):
                 input={
                     **_request_body()["input"],
                     "date_range": {
-                        "start": "2026-01-01T00:00:00Z",
-                        "end": "2026-04-02T00:00:00Z",
+                        "start": "2026-01-01",
+                        "end_exclusive": "2026-04-02",
+                        "timezone": "Asia/Shanghai",
                     },
                 }
             ),
@@ -608,40 +815,186 @@ async def test_region_denial_and_invalid_date_leave_no_task_or_key(migrated_db):
     assert dict(state) == {"tasks": 0, "keys": 0, "denials": 1}
 
 
-async def test_concurrent_same_key_requests_create_one_task(migrated_db, tmp_path):
-    await _seed_user_and_agent(migrated_db)
-    dataset_path = tmp_path / "business.jsonl"
-    write_dataset(dataset_path)
-    migrator = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
-    try:
-        await load_dataset(migrator, dataset_path)
-    finally:
-        await migrator.close()
-
-    app = _app(migrated_db)
+@pytest.mark.parametrize("expired", [False, True], ids=["new-key", "expired-key"])
+@pytest.mark.parametrize("conflicting", [False, True], ids=["same-hash", "different-hash"])
+async def test_in_flight_idempotency_serializes_replay_conflicts_and_expiry(
+    seeded_tasks_db, expired, conflicting
+):
+    db = seeded_tasks_db
+    conn = await asyncpg.connect(db["superuser_dsn"])
+    app = _app(db)
     headers = {
         "Authorization": f"Bearer {_token()}",
-        "Idempotency-Key": "concurrent-task-001",
+        "Idempotency-Key": "in-flight-create",
     }
+    first = second = None
+    prior_task_id = None
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        try:
+            if expired:
+                prior = await client.post("/api/v1/tasks", json=_request_body(), headers=headers)
+                assert prior.status_code == 202
+                prior_task_id = prior.json()["task_id"]
+                await conn.execute(
+                    "UPDATE runtime.idempotency_records "
+                    "SET expires_at = now() - interval '1 second' "
+                    "WHERE idempotency_key = 'in-flight-create'"
+                )
 
-    async def create():
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://testserver"
-        ) as client:
-            return await client.post("/api/v1/tasks", json=_request_body(), headers=headers)
+            await _install_task_insert_barrier(conn)
+            await conn.execute("SELECT pg_advisory_lock(50005)")
+            barrier_pid = conn.get_server_pid()
+            first = asyncio.create_task(client.post(
+                "/api/v1/tasks", json=_request_body(), headers=headers,
+            ))
+            first_pid = await _wait_for_blocked_statement(
+                conn, "INSERT INTO runtime.tasks", barrier_pid,
+            )
+            # The first request has claimed its key but cannot commit its Task.
+            assert not first.done()
+            second_body = _request_body()
+            if conflicting:
+                second_body["input"]["question"] = "A different concurrent question"
+            second = asyncio.create_task(client.post(
+                "/api/v1/tasks", json=second_body, headers=headers,
+            ))
+            await _wait_for_blocked_statement(
+                conn, "INSERT INTO runtime.idempotency_records", first_pid,
+            )
+            assert not second.done()
 
-    first, second = await asyncio.gather(create(), create())
-    assert first.status_code == second.status_code == 202
-    assert first.json() == second.json()
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
-    try:
-        counts = await conn.fetchrow(
-            """
-            SELECT (SELECT count(*) FROM runtime.tasks) AS tasks,
-                   (SELECT count(*) FROM runtime.task_events) AS events,
-                   (SELECT count(*) FROM audit.audit_events WHERE action = 'task.created') AS audits
-            """
-        )
-    finally:
-        await conn.close()
-    assert dict(counts) == {"tasks": 1, "events": 1, "audits": 1}
+            await conn.execute("SELECT pg_advisory_unlock(50005)")
+            created, repeated = await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+            assert created.status_code == 202
+            assert created.json()["task_id"] != prior_task_id
+            if conflicting:
+                assert repeated.status_code == 409
+                assert repeated.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+            else:
+                assert repeated.status_code == 202
+                assert repeated.json() == created.json()
+                assert repeated.content == created.content
+            counts = await conn.fetchrow(
+                """
+                SELECT (SELECT count(*) FROM runtime.tasks) AS tasks,
+                       (SELECT count(*) FROM runtime.task_events) AS events,
+                       (SELECT count(*) FROM audit.audit_events WHERE action = 'task.created') AS audits,
+                       (SELECT count(*) FROM runtime.idempotency_records) AS keys
+                """
+            )
+            expected = 2 if expired else 1
+            assert dict(counts) == {"tasks": expected, "events": expected, "audits": expected, "keys": 1}
+            stored = await conn.fetchrow(
+                "SELECT response_status, response_json, expires_at > now() + interval '23 hours' AS retained "
+                "FROM runtime.idempotency_records WHERE idempotency_key = 'in-flight-create'"
+            )
+            assert stored["response_status"] == 202
+            assert json.loads(stored["response_json"]) == created.json()
+            assert stored["retained"] is True
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock_all()")
+            await _cancel_pending(first, second)
+            await conn.close()
+
+
+async def test_creation_wins_retirement_lock_and_preserves_pinned_version(seeded_tasks_db):
+    db = seeded_tasks_db
+    observer = await asyncpg.connect(db["superuser_dsn"])
+    retirement = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    create = retire = None
+    headers = {"Authorization": f"Bearer {_token()}", "Idempotency-Key": "create-before-retire"}
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        try:
+            await _install_task_insert_barrier(observer)
+            await observer.execute("SELECT pg_advisory_lock(50005)")
+            create = asyncio.create_task(client.post(
+                "/api/v1/tasks", json=_request_body(), headers=headers,
+            ))
+            create_pid = await _wait_for_blocked_statement(
+                observer, "INSERT INTO runtime.tasks", observer.get_server_pid(),
+            )
+            retire = asyncio.create_task(retirement.execute(
+                "UPDATE registry.agent_versions SET status = 'retired' WHERE id = $1::uuid",
+                AGENT_VERSION_ID,
+            ))
+            await _wait_for_blocked_statement(
+                observer, "UPDATE registry.agent_versions", create_pid,
+            )
+            assert not retire.done()
+            await observer.execute("SELECT pg_advisory_unlock(50005)")
+            created, _ = await asyncio.wait_for(asyncio.gather(create, retire), timeout=10)
+            assert created.status_code == 202
+            assert created.json()["agent_version"] == "1.0.0"
+            replay = await client.post("/api/v1/tasks", json=_request_body(), headers=headers)
+            assert replay.status_code == 202
+            assert replay.json() == created.json()
+            detail = await client.get(created.json()["links"]["self"], headers=headers)
+            assert detail.status_code == 200
+            assert detail.json()["status"] == "queued"
+            denied = await client.post(
+                "/api/v1/tasks", json=_request_body(),
+                headers={**headers, "Idempotency-Key": "new-after-retire"},
+            )
+            assert denied.status_code == 400
+            assert denied.json()["error"]["code"] == "INVALID_REQUEST"
+            pinned = await observer.fetchval(
+                "SELECT agent_version_id::text FROM runtime.tasks WHERE id = $1::uuid",
+                created.json()["task_id"],
+            )
+            assert pinned == AGENT_VERSION_ID
+        finally:
+            await observer.execute("SELECT pg_advisory_unlock_all()")
+            await _cancel_pending(create, retire)
+            await retirement.close()
+            await observer.close()
+
+
+async def test_retirement_wins_lock_and_creation_rechecks_publication(seeded_tasks_db):
+    db = seeded_tasks_db
+    observer = await asyncpg.connect(db["superuser_dsn"])
+    retirement = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    transaction = retirement.transaction()
+    await transaction.start()
+    committed = False
+    create = None
+    headers = {"Authorization": f"Bearer {_token()}", "Idempotency-Key": "retire-before-create"}
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db), raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        try:
+            await retirement.execute(
+                "UPDATE registry.agent_versions SET status = 'retired' WHERE id = $1::uuid",
+                AGENT_VERSION_ID,
+            )
+            create = asyncio.create_task(client.post(
+                "/api/v1/tasks", json=_request_body(), headers=headers,
+            ))
+            await _wait_for_blocked_statement(
+                observer, "INSERT INTO runtime.tasks", retirement.get_server_pid(),
+            )
+            assert not create.done()
+            await transaction.commit()
+            committed = True
+            response = await asyncio.wait_for(create, timeout=10)
+            assert response.status_code == 400
+            assert response.json()["error"]["code"] == "INVALID_REQUEST"
+            counts = await observer.fetchrow(
+                """
+                SELECT (SELECT count(*) FROM runtime.tasks) AS tasks,
+                       (SELECT count(*) FROM runtime.task_events) AS events,
+                       (SELECT count(*) FROM audit.audit_events WHERE action = 'task.created') AS audits,
+                       (SELECT count(*) FROM runtime.idempotency_records) AS keys
+                """
+            )
+            assert dict(counts) == {"tasks": 0, "events": 0, "audits": 0, "keys": 0}
+        finally:
+            if not committed:
+                await transaction.rollback()
+            await _cancel_pending(create)
+            await retirement.close()
+            await observer.close()

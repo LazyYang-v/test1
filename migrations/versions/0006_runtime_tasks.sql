@@ -31,6 +31,34 @@ CREATE TABLE IF NOT EXISTS runtime.tasks (
     version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0)
 );
 
+-- Serialize initial Agent binding against retirement without giving the API
+-- permission to update Registry rows. The lock lasts through creation commit.
+CREATE OR REPLACE FUNCTION runtime.require_published_task_agent()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, registry, runtime
+AS $$
+DECLARE
+    agent_status TEXT;
+BEGIN
+    SELECT status INTO agent_status
+    FROM registry.agent_versions
+    WHERE id = NEW.agent_version_id
+    FOR SHARE;
+    IF agent_status IS DISTINCT FROM 'published' THEN
+        RAISE EXCEPTION 'task requires a published Agent version'
+            USING ERRCODE = '23514', CONSTRAINT = 'tasks_agent_must_be_published';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION runtime.require_published_task_agent() FROM PUBLIC;
+DROP TRIGGER IF EXISTS tasks_agent_publication_guard ON runtime.tasks;
+CREATE TRIGGER tasks_agent_publication_guard
+    BEFORE INSERT ON runtime.tasks
+    FOR EACH ROW EXECUTE FUNCTION runtime.require_published_task_agent();
+
 CREATE INDEX IF NOT EXISTS tasks_status_priority_created_idx
     ON runtime.tasks (status, priority DESC, created_at);
 CREATE INDEX IF NOT EXISTS tasks_owner_created_idx
