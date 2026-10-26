@@ -35,6 +35,8 @@ class WorkerSettings(BaseSettings):
     model_timeout_seconds: float = Field(default=60.0, gt=0)
     model_provider: str = "fake"
     max_concurrent_tasks: int = Field(default=1, ge=1, le=16)
+    otel_enabled: bool = False
+    otel_exporter_otlp_endpoint: str | None = None
 
     @field_validator("worker_db_dsn")
     @classmethod

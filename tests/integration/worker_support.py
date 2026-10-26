@@ -283,7 +283,8 @@ async def fetch_events(db: dict, task_id: str) -> list[dict[str, Any]]:
     try:
         rows = await conn.fetch(
             """
-            SELECT task_event_seq, event_type, payload_json, attempt_id::text AS attempt_id
+            SELECT task_event_seq, event_type, payload_json, attempt_id::text AS attempt_id,
+                   trace_id
             FROM runtime.task_events WHERE task_id = $1::uuid
             ORDER BY task_event_seq
             """,
@@ -297,6 +298,7 @@ async def fetch_events(db: dict, task_id: str) -> list[dict[str, Any]]:
             "type": row["event_type"],
             "payload": json.loads(row["payload_json"]),
             "attempt_id": row["attempt_id"],
+            "trace_id": row["trace_id"],
         }
         for row in rows
     ]
@@ -375,7 +377,7 @@ async def fetch_audits(db: dict, *, action: str) -> list[dict[str, Any]]:
     try:
         rows = await conn.fetch(
             """
-            SELECT decision, reason_code, metadata_json, resource_id
+            SELECT decision, reason_code, metadata_json, resource_id, trace_id
             FROM audit.audit_events WHERE action = $1 ORDER BY id
             """,
             action,

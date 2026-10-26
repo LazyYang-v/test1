@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from decimal import Decimal
 from typing import Any, TypedDict
@@ -28,6 +29,9 @@ from agentforge_harness.report import (
 from agentforge_harness.schemas import COMPOSE_SCHEMA, PLAN_SCHEMA
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
+from agentforge_core.observability import log_event, span
+
+logger = logging.getLogger("agentforge.worker")
 from agentforge_runtime.store import RuntimeStore
 from agentforge_worker.config import WorkerSettings
 
@@ -70,16 +74,28 @@ class RuntimeModelRecorder:
         self._agent_version_id = agent_version_id
         self._provider = provider
         self._model_name = model_name
+        self._trace_id = lease.trace_id
 
     async def record_started(self, invocation_key: str, request: ModelRequest) -> None:
+        with span(
+            "model.invocation",
+            trace_id=self._lease.trace_id,
+            task_id=self._lease.task_id,
+            attempt_id=self._lease.attempt_id,
+        ):
+            await self._record_started(invocation_key, request)
+
+    async def _record_started(
+        self, invocation_key: str, request: ModelRequest
+    ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO harness.model_invocations
                     (id, task_id, attempt_id, invocation_key, agent_version_id,
-                     provider, model_name, context_hash, status, started_at)
+                     provider, model_name, context_hash, status, started_at, trace_id)
                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8,
-                        'executing', now())
+                        'executing', now(), $9)
                 ON CONFLICT (task_id, invocation_key) DO NOTHING
                 """,
                 str(uuid.uuid4()),
@@ -90,6 +106,7 @@ class RuntimeModelRecorder:
                 self._provider,
                 self._model_name,
                 request.context_hash or _hash(request.messages),
+                self._lease.trace_id,
             )
 
     async def record_finished(
@@ -106,7 +123,8 @@ class RuntimeModelRecorder:
                 """
                 UPDATE harness.model_invocations
                 SET status = $4, input_tokens = $5, output_tokens = $6,
-                    estimated_cost = $7, error_code = $8, finished_at = now()
+                    estimated_cost = $7, error_code = $8, finished_at = now(),
+                    trace_id = $9
                 WHERE task_id = $1::uuid AND invocation_key = $2
                   AND attempt_id = $3::uuid
                 """,
@@ -118,6 +136,7 @@ class RuntimeModelRecorder:
                 0 if response is None else response.output_tokens,
                 Decimal("0") if response is None else response.estimated_cost,
                 error_code,
+                self._trace_id,
             )
 
 
@@ -211,12 +230,19 @@ class AnalysisGraph:
                     region_scope=tuple(task["region_scope_json"]),
                     lease_token=lease.lease_token,
                     fencing_epoch=lease.fencing_epoch,
+                    trace_id=task["trace_id"],
                     step_key="execute_metrics:0",
                     task_snapshot_id=task["data_snapshot_id"],
                 )
-                accepted = await self._gateway.invoke(
-                    context, "metrics.query", plan
-                )
+                with span(
+                    "tool.invocation",
+                    trace_id=context.trace_id,
+                    task_id=context.task_id,
+                    attempt_id=context.attempt_id,
+                ):
+                    accepted = await self._gateway.invoke(
+                        context, "metrics.query", plan
+                    )
                 return {
                     "tool_result": accepted["result"],
                     "evidence_id": accepted["evidence_id"],

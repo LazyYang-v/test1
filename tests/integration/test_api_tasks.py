@@ -200,6 +200,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         )
 
     assert response.status_code == 202
+    assert response.headers["X-Request-ID"] == "task-create-request-001"
     payload = response.json()
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
@@ -215,7 +216,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         task = await conn.fetchrow(
             """
             SELECT owner_user_id::text AS owner_user_id,
-                   agent_version_id::text AS agent_version_id, status,
+                   agent_version_id::text AS agent_version_id, trace_id, status,
                    input_json, region_scope_json, authorization_snapshot,
                    data_snapshot_id, current_attempt_no, created_at
             FROM runtime.tasks WHERE id = $1::uuid
@@ -231,7 +232,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         )
         audit = await conn.fetchrow(
             """
-            SELECT action, resource_id, decision FROM audit.audit_events
+            SELECT action, resource_id, decision, trace_id FROM audit.audit_events
             WHERE action = 'task.created' AND resource_id = $1
             """,
             task_id,
@@ -241,6 +242,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
 
     assert task["owner_user_id"] == USER_ID
     assert task["agent_version_id"] == AGENT_VERSION_ID
+    assert task["trace_id"] == task_id
     assert task["status"] == "queued"
     assert task["region_scope_json"] == '["CN_EAST"]'
     assert json.loads(task["authorization_snapshot"]) == [
@@ -248,12 +250,13 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
     ]
     assert event["task_event_seq"] == 1
     assert event["event_type"] == "task.created"
-    assert event["trace_id"] == "task-create-request-001"
+    assert event["trace_id"] == task_id
     assert (audit["action"], audit["resource_id"], audit["decision"]) == (
         "task.created",
         task_id,
         "allowed",
     )
+    assert audit["trace_id"] == task_id
     assert task["data_snapshot_id"].strip() == (
         "e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8"
     )

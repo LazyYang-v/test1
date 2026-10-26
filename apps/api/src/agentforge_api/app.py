@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -22,7 +24,17 @@ from agentforge_api.auth import (
 )
 from agentforge_api.config import Settings
 from agentforge_api.readiness import check_database_readiness
+from agentforge_api.observability import (
+    configure_json_logging,
+    configure_telemetry,
+    log_event,
+)
+from agentforge_api.rate_limit import StreamConcurrencyLimiter, TokenBucketLimiter
 from agentforge_api.tasks import router as task_router
+from agentforge_core.observability import span
+
+logger = logging.getLogger("agentforge.api")
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 @asynccontextmanager
@@ -104,6 +116,7 @@ async def authorize_region(
 def _error_response(request: Request, error: ApiError) -> JSONResponse:
     return JSONResponse(
         status_code=error.status_code,
+        headers=error.headers,
         content={
             "error": {
                 "code": error.code,
@@ -113,11 +126,11 @@ def _error_response(request: Request, error: ApiError) -> JSONResponse:
             },
             "request_id": request.state.request_id,
         },
-        headers=error.headers,
     )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    configure_json_logging()
     app_settings = settings or Settings()
 
     @asynccontextmanager
@@ -126,6 +139,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
         app.state.connect_events = lambda: _database_connection(
             app_settings.api_db_dsn, timeout=1.0
+        )
+        configure_telemetry(
+            app_settings.otel_enabled, app_settings.otel_exporter_otlp_endpoint
         )
         yield
 
@@ -137,12 +153,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.connect_events = lambda: _database_connection(
         app_settings.api_db_dsn, timeout=1.0
     )
+    app.state.stream_limiter = StreamConcurrencyLimiter(
+        global_limit=100, per_principal_limit=5
+    )
+    app.state.rate_limiter = TokenBucketLimiter(
+        rate=app_settings.rate_limit_per_second,
+        burst=app_settings.rate_limit_burst,
+        max_entries=app_settings.rate_limit_max_entries,
+        idle_timeout=app_settings.rate_limit_idle_seconds,
+    )
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        supplied_request_id = request.headers.get("X-Request-ID", "")
+        request_id = (
+            supplied_request_id
+            if _REQUEST_ID_PATTERN.fullmatch(supplied_request_id)
+            else str(uuid.uuid4())
+        )
         request.state.request_id = request_id
-        response = await call_next(request)
+        request.state.trace_id = request_id
+        with span(
+            "http.request",
+            request_id=request_id,
+            method=request.method,
+            route=request.url.path,
+        ):
+            try:
+                response = await call_next(request)
+            except Exception:
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "request.failed",
+                    request_id=request_id,
+                    route=request.url.path,
+                    method=request.method,
+                    error_code="INTERNAL_ERROR",
+                )
+                raise
+        if response.status_code >= 500:
+            log_event(
+                logger,
+                logging.ERROR,
+                "request.failed",
+                request_id=request_id,
+                status_code=response.status_code,
+                error_code="INTERNAL_ERROR",
+            )
+        else:
+            log_event(
+                logger,
+                logging.INFO,
+                "request.completed",
+                request_id=request_id,
+                status_code=response.status_code,
+            )
         response.headers["X-Request-ID"] = request_id
         return response
 

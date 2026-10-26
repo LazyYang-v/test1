@@ -46,6 +46,7 @@ def _row_to_lease(row: asyncpg.Record) -> AttemptLease:
         lease_token=str(row["lease_token"]),
         fencing_epoch=row["fencing_epoch"],
         lease_expires_at=row["lease_expires_at"],
+        trace_id=row.get("trace_id"),
     )
 
 
@@ -127,7 +128,7 @@ class RuntimeStore:
                       )
                       AND (task.deadline_at IS NULL OR task.deadline_at > now())
                       AND task.current_attempt_no < task.max_attempts
-                    RETURNING task.id, task.current_attempt_no
+                    RETURNING task.id, task.current_attempt_no, task.trace_id
                     """,
                     candidate["id"],
                     CANCEL_REQUEST_EVENT,
@@ -135,6 +136,7 @@ class RuntimeStore:
                 if task is None:
                     return None
                 attempt_no = task["current_attempt_no"]
+                task_trace_id = task["trace_id"]
                 row = await conn.fetchrow(
                     """
                     INSERT INTO runtime.task_attempts
@@ -155,6 +157,8 @@ class RuntimeStore:
                     lease_token,
                     self.lease_seconds,
                 )
+                row = dict(row)
+                row["trace_id"] = task_trace_id
                 await self._append_event(
                     conn,
                     task_id=str(task["id"]),
@@ -299,7 +303,7 @@ class RuntimeStore:
                 SELECT id::text AS task_id, owner_user_id::text AS owner_user_id,
                        agent_version_id::text AS agent_version_id, task_type,
                        status, input_json, input_hash, region_scope_json,
-                       authorization_snapshot, data_snapshot_id, priority,
+                       authorization_snapshot, data_snapshot_id, trace_id, priority,
                        current_attempt_no, max_attempts, deadline_at, created_at
                 FROM runtime.tasks WHERE id = $1::uuid
                 """,
@@ -1531,6 +1535,10 @@ class RuntimeStore:
         payload: dict[str, Any],
     ) -> int:
         await self._lock_events(conn, task_id)
+        trace_id = await conn.fetchval(
+            "SELECT trace_id FROM runtime.tasks WHERE id = $1::uuid",
+            task_id,
+        )
         seq = await conn.fetchval(
             "SELECT COALESCE(MAX(task_event_seq), 0) + 1 FROM runtime.task_events "
             "WHERE task_id = $1::uuid",
@@ -1539,14 +1547,15 @@ class RuntimeStore:
         await conn.execute(
             """
             INSERT INTO runtime.task_events
-                (task_id, attempt_id, task_event_seq, event_type, payload_json)
-            VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb)
+                (task_id, attempt_id, task_event_seq, event_type, payload_json, trace_id)
+            VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6)
             """,
             task_id,
             attempt_id,
             seq,
             event_type,
             _canonical(payload),
+            trace_id,
         )
         await conn.execute(
             "SELECT pg_notify($1, $2)",

@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     api_db_dsn: str = "postgresql://agentforge_api@localhost:5432/agentforge"
     jwt_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(48), min_length=32)
     jwt_ttl_seconds: int = Field(default=900, ge=1, le=900)
+    rate_limit_per_second: float = Field(default=5.0, gt=0, le=1000)
+    rate_limit_burst: int = Field(default=30, ge=1)
+    rate_limit_max_entries: int = Field(default=10_000, ge=1)
+    rate_limit_idle_seconds: float = Field(default=3600, gt=0, le=86_400)
+    otel_enabled: bool = False
+    otel_exporter_otlp_endpoint: str | None = None
 
     @field_validator("api_db_dsn")
     @classmethod

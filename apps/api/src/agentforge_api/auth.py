@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,6 +15,11 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from agentforge_api.rate_limit import TokenBucketLimiter
+from agentforge_core.observability import log_event
+
+logger = logging.getLogger("agentforge.api")
 
 _PASSWORDS = PasswordHasher(time_cost=2, memory_cost=19_456, parallelism=1)
 _DUMMY_PASSWORD_HASH = _PASSWORDS.hash(secrets.token_urlsafe(32))
@@ -124,4 +131,21 @@ async def current_principal(
         ):
             await log_auth_failure(conn, request, "inactive_or_stale_token")
             raise ApiError(401, "UNAUTHENTICATED", "Authentication required")
+    limiter: TokenBucketLimiter = request.app.state.rate_limiter
+    allowed, retry_after = limiter.consume(str(user["id"]))
+    if not allowed:
+        log_event(
+            logger,
+            logging.WARNING,
+            "rate_limited",
+            request_id=request.state.request_id,
+            error_code="RATE_LIMITED",
+        )
+        raise ApiError(
+            429,
+            "RATE_LIMITED",
+            "Request rate limit exceeded",
+            retryable=True,
+            headers={"Retry-After": str(retry_after)},
+        )
     return dict(user)

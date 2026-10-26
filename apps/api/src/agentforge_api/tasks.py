@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, date, datetime
@@ -19,14 +20,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
+from agentforge_core.observability import log_event, span
 
+logger = logging.getLogger("agentforge.api")
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 _SSE_BEARER = HTTPBearer(auto_error=False)
 _EVENT_CHANNEL = "agentforge_task_events"
 _EVENT_POLL_SECONDS = 10.0
 _MAX_EVENT_ID = 9_223_372_036_854_775_807
 _EVENT_DB_TIMEOUT_SECONDS = 1.0
-_EVENT_REAUTH_SECONDS = 30.0
 _EVENT_RETRY_SECONDS = 1.0
 _TRANSIENT_EVENT_DB_ERRORS = (
     OSError,
@@ -359,10 +361,10 @@ async def create_task(
                 created_at = await conn.fetchval(
                     """
                     INSERT INTO runtime.tasks
-                        (id, owner_user_id, agent_version_id, task_type, status,
+                        (id, trace_id, owner_user_id, agent_version_id, task_type, status,
                          input_json, input_hash, region_scope_json, authorization_snapshot,
                          data_snapshot_id, max_attempts, deadline_at)
-                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
+                    VALUES ($1::uuid, $1::text, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
                             $7::jsonb, $8::jsonb, $9, $10,
                             now() + ($11 * interval '1 second'))
                     RETURNING created_at
@@ -393,7 +395,7 @@ async def create_task(
                 """,
                 task_id,
                 _canonical({"status": "queued"}),
-                request.state.request_id,
+                task_id,
             )
             await _notify_task_event(conn, task_id, 1)
             await conn.execute(
@@ -412,7 +414,7 @@ async def create_task(
                     "region_codes": body.input.region_codes,
                     "data_snapshot_id": snapshot["data_snapshot_id"].strip(),
                 }),
-                request.state.request_id,
+                task_id,
             )
             response = _task_response(
                 task_id, agent_version=agent["version"], created_at=created_at
@@ -428,6 +430,15 @@ async def create_task(
                 task_id,
                 _canonical(response),
             )
+    with span("task.create", trace_id=task_id, task_id=task_id):
+        log_event(
+            logger,
+            logging.INFO,
+            "task.created",
+            request_id=request.state.request_id,
+            trace_id=task_id,
+            task_id=task_id,
+        )
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 
@@ -455,7 +466,7 @@ async def cancel_task(
             )
             row = await conn.fetchrow(
                 """
-                SELECT task.status, task.version,
+                SELECT task.status, task.version, task.trace_id,
                        (task.deadline_at IS NOT NULL
                         AND task.deadline_at <= now()) AS expired,
                        EXISTS (
@@ -535,7 +546,7 @@ async def cancel_task(
                     "requested_by": principal["id"],
                     "target_status": target_status,
                 }),
-                request.state.request_id,
+                row["trace_id"],
             )
             await _notify_task_event(conn, task_id_str, seq)
             if target_status == "cancelled":
@@ -549,7 +560,7 @@ async def cancel_task(
                     task_id_str,
                     seq + 1,
                     _canonical({"reason": body.reason, "source": "api"}),
-                    request.state.request_id,
+                    row["trace_id"],
                 )
                 await _notify_task_event(conn, task_id_str, seq + 1)
             await conn.execute(
@@ -567,7 +578,7 @@ async def cancel_task(
                     "expected_version": body.expected_version,
                     "target_status": target_status,
                 }),
-                request.state.request_id,
+                row["trace_id"],
             )
     return JSONResponse(
         status_code=202,
@@ -689,7 +700,6 @@ async def _task_event_stream(
     """Replay persisted events and use LISTEN only to wake up the DB reader."""
     listener = None
     wakeup = asyncio.Event()
-    next_reauthorization = 0.0
 
     def on_notification(_connection, _process_id, _channel, payload):
         try:
@@ -708,13 +718,6 @@ async def _task_event_stream(
         while True:
             if int(datetime.now(UTC).timestamp()) >= token_expiry:
                 break
-
-            now_monotonic = asyncio.get_running_loop().time()
-            if now_monotonic >= next_reauthorization:
-                # No event rows are released after account, token, ownership, or
-                # live grant revocation is observed. The same query below repeats
-                # this check before reading each persisted batch.
-                pass
 
             if listener is None or listener.is_closed():
                 if listener is not None:

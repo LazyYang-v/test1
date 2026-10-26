@@ -7,6 +7,7 @@ import logging
 import signal
 
 import asyncpg
+from agentforge_core.observability import configure_json_logging, configure_telemetry
 from agentforge_core.migrations import fetch_applied_version
 from agentforge_core.schema_version import SCHEMA_VERSION
 
@@ -31,6 +32,11 @@ async def _require_current_schema(dsn: str) -> None:
 
 async def _run() -> None:
     settings = WorkerSettings()
+    configure_telemetry(
+        settings.otel_enabled,
+        settings.otel_exporter_otlp_endpoint,
+        service_name="agentforge-worker",
+    )
     await _require_current_schema(settings.worker_db_dsn)
     pool = await asyncpg.create_pool(
         settings.worker_db_dsn,
@@ -62,10 +68,7 @@ async def _run() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_json_logging()
     asyncio.run(_run())
 
 
