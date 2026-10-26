@@ -88,3 +88,25 @@ def test_schema_validation_rejects_invalid_input_with_details():
         )
     assert raised.value.code == "TOOL_INPUT_INVALID"
     assert raised.value.details
+
+
+def test_metric_query_plan_schema_defers_registration_to_semantic_validator():
+    from agentforge_harness.schemas import PLAN_SCHEMA
+
+    validate_schema(
+        {
+            "metric": "unregistered_metric",
+            "metric_version": 1,
+            "dimensions": ["region_code"],
+            "filters": {"region_code": ["CN_EAST"]},
+            "time_range": {
+                "start": "2025-03-31",
+                "end_exclusive": "2025-04-07",
+                "timezone": "UTC",
+            },
+            "comparison": "previous_period",
+            "limit": 100,
+        },
+        PLAN_SCHEMA,
+        error_code="MODEL_OUTPUT_INVALID",
+    )

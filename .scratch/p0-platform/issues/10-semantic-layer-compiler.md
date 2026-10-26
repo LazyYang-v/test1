@@ -4,7 +4,7 @@
 
 **Blocked by:** 07
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Metric Query Plan 只接受注册指标/维度/过滤；未注册 → 422 QUERY_PLAN_INVALID
 - [ ] 管线六段成型，模板路径被完全替换；结果经 ResultNormalizer 归一
@@ -14,3 +14,7 @@
 - [ ] 执行角色无业务写权限（HS-08）；固定 search_path
 - [ ] 超出最大时间范围/返回行数/查询时长 → 拒绝（HS-09）
 - [ ] BA-01~08 全部断言在新管线下无回归
+
+## Comments
+
+2026-10-26: Implementation started on `ticket/10-semantic-layer-compiler` from `integration/p0` tip `ac8ee23`. Scope: replace the focused GMV compiler with a registry-driven plan/compile/AST-validation/execution/normalization pipeline while preserving the ticket 07 API-to-worker Evidence behavior. Status claimed; resolution remains with the merger.
