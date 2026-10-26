@@ -11,7 +11,7 @@ from typing import Any
 
 import asyncpg
 from agentforge_core.schema_version import SCHEMA_VERSION  # noqa: F401
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 
 from agentforge_api.app import create_app
 from agentforge_api.auth import create_access_token
@@ -166,6 +166,8 @@ def create_task_body(
     *,
     region_codes: list[str] | None = None,
     question: str = "Explain the change in CN_EAST GMV from the previous period",
+    max_attempts: int = 1,
+    timeout_seconds: int = 60,
 ) -> dict[str, Any]:
     return {
         "agent_key": agent_key,
@@ -176,7 +178,10 @@ def create_task_body(
             "date_range": dict(FROZEN_DATE_RANGE),
             "compare_mode": "previous_period",
         },
-        "execution": {"timeout_seconds": 60, "max_attempts": 1},
+        "execution": {
+            "timeout_seconds": timeout_seconds,
+            "max_attempts": max_attempts,
+        },
     }
 
 
@@ -186,6 +191,8 @@ async def create_task_via_api(
     *,
     idempotency_key: str | None = None,
     region_codes: list[str] | None = None,
+    max_attempts: int = 1,
+    timeout_seconds: int = 60,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {token()}",
@@ -196,11 +203,35 @@ async def create_task_via_api(
     ) as client:
         response = await client.post(
             "/api/v1/tasks",
-            json=create_task_body(agent_key, region_codes=region_codes),
+            json=create_task_body(
+                agent_key,
+                region_codes=region_codes,
+                max_attempts=max_attempts,
+                timeout_seconds=timeout_seconds,
+            ),
             headers=headers,
         )
     assert response.status_code == 202, response.text
     return response.json()["task_id"]
+
+
+async def post_cancel_via_api(
+    db: dict,
+    task_id: str,
+    expected_version: int,
+    *,
+    reason: str = "operator requested cancellation",
+    user_id: str = USER_ID,
+) -> "Response":
+    headers = {"Authorization": f"Bearer {token(user_id)}"}
+    async with AsyncClient(
+        transport=ASGITransport(app=app_for(db)), base_url="http://testserver"
+    ) as client:
+        return await client.post(
+            f"/api/v1/tasks/{task_id}/cancel",
+            json={"reason": reason, "expected_version": expected_version},
+            headers=headers,
+        )
 
 
 async def get_task_via_api(db: dict, task_id: str) -> dict[str, Any]:
@@ -218,8 +249,10 @@ async def fetch_task(db: dict, task_id: str) -> dict[str, Any]:
     try:
         row = await conn.fetchrow(
             """
-            SELECT id::text AS task_id, status, current_attempt_no, result_json,
-                   error_code, error_message, completed_at, data_snapshot_id
+            SELECT id::text AS task_id, status, version, current_attempt_no,
+                   max_attempts, result_json, error_code, error_message,
+                   completed_at, data_snapshot_id, cancel_requested_at,
+                   next_retry_at, deadline_at
             FROM runtime.tasks WHERE id = $1::uuid
             """,
             task_id,
