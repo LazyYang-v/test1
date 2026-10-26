@@ -10,6 +10,10 @@ docker compose up --build
 
 The API is available at `http://localhost:8000`. `/health/live` reports process liveness; `/health/ready` returns success only when PostgreSQL is reachable and the applied migration version matches this API. The PostgreSQL healthcheck probes TCP so the temporary Unix-socket-only initialization server cannot satisfy it.
 
+## Task event streams
+
+Subscribe to `GET /api/v1/tasks/{id}/events` with the task owner's bearer token. The response is an SSE stream; each event uses `task_event_seq` as its `id`, the persisted event type as its `event`, and compact JSON as its `data`. Send the last received sequence in `Last-Event-ID` when reconnecting to replay all later persisted events. Delivery is at least once across reconnects, so clients should deduplicate by event ID. Keep the latest parsed event ID as the resume cursor; heartbeats are SSE comments and have no ID.
+
 The PostgreSQL init script creates `agentforge_migrator` as a non-superuser with `CREATEROLE`, assigns database ownership, and creates the separate `agentforge_registry_cli` login using `AGENTFORGE_REGISTRY_DB_PASSWORD`. This is one-time cluster bootstrap, executed only when the PostgreSQL data volume is first initialized. Migration 0001 creates the API, worker, business read-only, and evaluation roles. The one-shot migration job connects as `agentforge_migrator`; the API connects as `agentforge_api` and never runs migrations. If you change a password while keeping an existing database volume, update the corresponding role password in PostgreSQL to match.
 
 Registry operations use the `agentforge-registry` command with `AGENTFORGE_REGISTRY_DSN` pointing to a connection as `agentforge_registry_cli`. That login has schema usage and DML on the four Registry tables; publication and retirement rules are enforced by database triggers. Published Agent versions retain their frozen model configuration even if the source model profile changes.

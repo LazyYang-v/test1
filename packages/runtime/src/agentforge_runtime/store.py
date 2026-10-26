@@ -651,4 +651,9 @@ class RuntimeStore:
             event_type,
             _canonical(payload),
         )
+        await conn.execute(
+            "SELECT pg_notify($1, $2)",
+            "agentforge_task_events",
+            _canonical({"task_id": task_id, "seq": seq}),
+        )
         return seq

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import re
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any, Literal
@@ -11,12 +13,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+_EVENT_CHANNEL = "agentforge_task_events"
+_EVENT_POLL_SECONDS = 10.0
+_MAX_EVENT_ID = 9_223_372_036_854_775_807
 
 
 def _canonical(value: Any) -> str:
@@ -29,6 +34,14 @@ def _hash(value: Any) -> str:
 
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
+
+
+async def _notify_task_event(conn: asyncpg.Connection, task_id: str, sequence: int) -> None:
+    await conn.execute(
+        "SELECT pg_notify($1, $2)",
+        _EVENT_CHANNEL,
+        _canonical({"task_id": task_id, "seq": sequence}),
+    )
 
 
 class DateRange(BaseModel):
@@ -344,6 +357,7 @@ async def create_task(
                 _canonical({"status": "queued"}),
                 request.state.request_id,
             )
+            await _notify_task_event(conn, task_id, 1)
             await conn.execute(
                 """
                 INSERT INTO audit.audit_events
@@ -426,6 +440,153 @@ async def list_tasks(
         "offset": offset,
         "has_more": has_more,
     }
+
+
+def _event_cursor(value: str | None) -> int:
+    if value is None:
+        return 0
+    if not re.fullmatch(r"[0-9]{1,19}", value):
+        raise ApiError(400, "INVALID_REQUEST", "Last-Event-ID must be a nonnegative integer")
+    cursor = int(value)
+    if cursor > _MAX_EVENT_ID:
+        raise ApiError(400, "INVALID_REQUEST", "Last-Event-ID is too large")
+    return cursor
+
+
+def _sse_frame(row: asyncpg.Record) -> bytes:
+    payload = _json_value(row["payload_json"])
+    data = _canonical(payload)
+    event_type = str(row["event_type"]).replace("\r", "").replace("\n", "")
+    return (
+        f"id: {row['task_event_seq']}\nevent: {event_type}\ndata: {data}\n\n"
+    ).encode("utf-8")
+
+
+async def _task_event_stream(request: Request, task_id: str, cursor: int):
+    """Replay persisted events and use LISTEN only to wake up the DB reader."""
+    listener = None
+    wakeup = asyncio.Event()
+
+    def on_notification(_connection, _process_id, _channel, payload):
+        try:
+            notification = json.loads(payload)
+            if notification.get("task_id") == task_id:
+                wakeup.set()
+        except (TypeError, ValueError, AttributeError):
+            # Notifications are hints; malformed hints are ignored and polling
+            # continues to read the durable event history.
+            return
+
+    def on_listener_termination(_connection):
+        wakeup.set()
+
+    try:
+        while True:
+            if listener is None or listener.is_closed():
+                if listener is not None:
+                    await listener.close()
+                try:
+                    listener = await asyncpg.connect(
+                        request.app.state.settings.api_db_dsn,
+                        timeout=5,
+                        server_settings={"application_name": "agentforge-sse-listener-starting"},
+                    )
+                    await listener.add_listener(_EVENT_CHANNEL, on_notification)
+                    await listener.execute("SET application_name = 'agentforge-sse-listener'")
+                    listener.add_termination_listener(on_listener_termination)
+                except (
+                    OSError,
+                    asyncpg.InterfaceError,
+                    asyncpg.PostgresConnectionError,
+                    asyncio.TimeoutError,
+                ):
+                    if listener is not None:
+                        await listener.close()
+                    listener = None
+
+            wakeup.clear()
+            try:
+                async with request.app.state.connect() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT task_event_seq, event_type, payload_json
+                        FROM runtime.task_events
+                        WHERE task_id = $1::uuid AND task_event_seq > $2
+                        ORDER BY task_event_seq
+                        """,
+                        task_id,
+                        cursor,
+                    )
+            except (
+                OSError,
+                asyncpg.InterfaceError,
+                asyncpg.PostgresConnectionError,
+                asyncio.TimeoutError,
+            ):
+                # A temporary query-connection failure must not end the client
+                # stream; retry from the last delivered sequence after a short wait.
+                if listener is not None:
+                    await listener.close()
+                    listener = None
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=1.0)
+                except TimeoutError:
+                    pass
+                yield b": keep-alive\n\n"
+                continue
+
+            if rows:
+                for row in rows:
+                    seq = row["task_event_seq"]
+                    if seq <= cursor:
+                        continue
+                    cursor = seq
+                    yield _sse_frame(row)
+                continue
+
+            # Notifications arriving during the query set the wakeup event;
+            # clear only before querying so the commit/query/wait race is closed.
+            poll_seconds = min(
+                _EVENT_POLL_SECONDS,
+                max(0.01, float(getattr(request.app.state, "event_poll_seconds", _EVENT_POLL_SECONDS))),
+            )
+            wait_seconds = min(poll_seconds, 1.0) if listener is None else poll_seconds
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=wait_seconds)
+            except TimeoutError:
+                pass
+            # Heartbeat comments carry no sequence and are safe to ignore.
+            yield b": keep-alive\n\n"
+    finally:
+        if listener is not None:
+            await listener.close()
+
+
+@router.get("/{task_id}/events")
+async def stream_task_events(
+    task_id: uuid.UUID,
+    request: Request,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    principal: dict[str, Any] = Depends(current_principal),
+):
+    async with request.app.state.connect() as conn:
+        owns_task = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM runtime.tasks WHERE id = $1::uuid AND owner_user_id = $2::uuid)",
+            str(task_id),
+            principal["id"],
+        )
+    if not owns_task:
+        raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+    cursor = _event_cursor(last_event_id)
+
+    return StreamingResponse(
+        _task_event_stream(request, str(task_id), cursor),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{task_id}")
