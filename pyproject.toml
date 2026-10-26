@@ -6,6 +6,9 @@ requires-python = ">=3.12"
 dependencies = [
     "agentforge-api",
     "agentforge-core",
+    "agentforge-harness",
+    "agentforge-runtime",
+    "agentforge-worker",
 ]
 
 [dependency-groups]
@@ -18,6 +21,9 @@ dev = [
 [tool.uv.sources]
 agentforge-api = { workspace = true }
 agentforge-core = { workspace = true }
+agentforge-harness = { workspace = true }
+agentforge-runtime = { workspace = true }
+agentforge-worker = { workspace = true }
 
 [tool.uv.workspace]
 members = ["apps/*", "packages/*"]
