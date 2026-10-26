@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS harness.evidences (
 
 CREATE INDEX IF NOT EXISTS evidences_task_idx
     ON harness.evidences (task_id, metric_key, metric_version);
+CREATE UNIQUE INDEX IF NOT EXISTS evidences_tool_invocation_unique
+    ON harness.evidences (tool_invocation_id)
+    WHERE tool_invocation_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION harness.reject_evidence_mutation()
 RETURNS trigger

@@ -39,8 +39,9 @@ _METRIC_KEYS = {
 class ReportValidationError(ValueError):
     """Raised when a report is malformed or cannot be traced to evidence."""
 
-    def __init__(self, code: str, detail: str = ""):
+    def __init__(self, code: str, detail: str = "", *, evidence_id: str | None = None):
         self.code = code
+        self.evidence_id = evidence_id
         super().__init__(f"{code}: {detail}" if detail else code)
 
 
@@ -162,7 +163,9 @@ def _resolve_evidence(
     evidence = index.get(evidence_id)
     if evidence is None:
         raise ReportValidationError(
-            "REPORT_EVIDENCE_MISSING", f"unknown evidence id {evidence_id}"
+            "REPORT_EVIDENCE_MISSING",
+            f"unknown evidence id {evidence_id}",
+            evidence_id=evidence_id,
         )
     if evidence.task_id != task_id:
         raise ReportValidationError(

@@ -383,6 +383,15 @@ class ToolGateway:
         except ToolOutputError as error:
             await reject(error.code, str(error), descriptor)
 
+        if str(result.get("data_snapshot_id", "")).strip() != (
+            context.task_snapshot_id.strip()
+        ):
+            await reject(
+                "TOOL_OUTPUT_INVALID",
+                "tool result is not bound to the task data snapshot",
+                descriptor,
+            )
+
         # 9. Persist acceptance plus audit/trace in a fenced short transaction.
         accepted = await self._backend.accept(
             context,
