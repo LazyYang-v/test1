@@ -5,6 +5,7 @@ import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from fastapi.testclient import TestClient
 
 from agentforge_api.app import create_app
 from agentforge_api.config import Settings
@@ -73,12 +74,14 @@ def test_json_logs_include_safe_correlation_and_exclude_payloads(caplog):
     )
 
 
-def test_otel_configuration_is_disabled_without_endpoint_by_default(monkeypatch):
+def test_otel_disabled_api_startup_does_not_require_endpoint(monkeypatch):
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     settings = Settings()
     assert settings.otel_enabled is False
     assert settings.otel_exporter_otlp_endpoint is None
-    configure_telemetry(False, None)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/health/live").json() == {"status": "alive"}
 
 
 def test_enabling_otel_without_endpoint_fails_clearly(monkeypatch):

@@ -21,6 +21,12 @@ from agentforge_core.observability import log_event, span
 logger = logging.getLogger("agentforge.api")
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+CANCEL_REQUEST_EVENT = "task.cancel.requested"
+CANCELLABLE_TASK_STATUSES = frozenset(
+    {"queued", "retry_wait", "running", "recovering"}
+)
+
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -152,6 +158,21 @@ class CreateTaskRequest(BaseModel):
             "input": self.input.canonical_json(),
             "execution": self.execution.model_dump(mode="json"),
         }
+
+
+class CancelTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2000)
+    expected_version: int = Field(ge=1)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be blank")
+        return value
 
 
 def _task_response(
@@ -391,6 +412,165 @@ async def create_task(
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 
+@router.post("/{task_id}/cancel", status_code=202)
+async def cancel_task(
+    task_id: uuid.UUID,
+    body: CancelTaskRequest,
+    request: Request,
+    principal: dict[str, Any] = Depends(current_principal),
+):
+    """Record an owner-scoped, optimistic-version cancellation request.
+
+    The API role is intentionally append-only for Runtime state: it persists
+    the request event inside a per-Task advisory lock and the Worker state
+    machine materializes ``cancelling``/``cancelled``. This keeps terminal
+    transitions fenced by the owning attempt and preserves the least-privilege
+    role boundary (the API never gains UPDATE on ``runtime.tasks``).
+    """
+    task_id_str = str(task_id)
+    async with request.app.state.connect() as conn:
+        async with conn.transaction():
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                task_id_str,
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT task.status, task.version, task.trace_id,
+                       (task.deadline_at IS NOT NULL
+                        AND task.deadline_at <= now()) AS expired,
+                       EXISTS (
+                           SELECT 1 FROM runtime.task_events AS event
+                           WHERE event.task_id = task.id
+                             AND event.event_type = $3
+                       ) AS cancel_requested
+                FROM runtime.tasks AS task
+                WHERE task.id = $1::uuid AND task.owner_user_id = $2::uuid
+                """,
+                task_id_str,
+                principal["id"],
+                CANCEL_REQUEST_EVENT,
+            )
+            if row is None:
+                raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+            if row["status"] in TERMINAL_TASK_STATUSES:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task is already in a terminal state",
+                    details={"status": row["status"]},
+                )
+            if row["version"] != body.expected_version:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "expected_version does not match the current task version",
+                    details={"current_version": row["version"]},
+                )
+            if row["status"] not in CANCELLABLE_TASK_STATUSES:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task cannot be cancelled from its current state",
+                    details={"status": row["status"]},
+                )
+            if row["expired"]:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task deadline has already passed",
+                )
+            if row["cancel_requested"]:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task cancellation is already in progress",
+                )
+
+            # A Task that is not executing has no attempt that must stop, so
+            # cancellation is decided immediately. A running Task enters
+            # ``cancelling`` and the owning worker performs the fenced terminal
+            # transition. The API role is append-only for Runtime state; the
+            # Worker scanner materializes the status column shortly after.
+            target_status = (
+                "cancelling" if row["status"] == "running" else "cancelled"
+            )
+            seq = await conn.fetchval(
+                "SELECT COALESCE(MAX(task_event_seq), 0) + 1 "
+                "FROM runtime.task_events WHERE task_id = $1::uuid",
+                task_id_str,
+            )
+            await conn.execute(
+                """
+                INSERT INTO runtime.task_events
+                    (task_id, attempt_id, task_event_seq, event_type,
+                     payload_json, trace_id)
+                VALUES ($1::uuid, NULL, $2, $3, $4::jsonb, $5)
+                """,
+                task_id_str,
+                seq,
+                CANCEL_REQUEST_EVENT,
+                _canonical({
+                    "reason": body.reason,
+                    "expected_version": body.expected_version,
+                    "requested_by": principal["id"],
+                    "target_status": target_status,
+                }),
+                row["trace_id"],
+            )
+            if target_status == "cancelled":
+                await conn.execute(
+                    """
+                    INSERT INTO runtime.task_events
+                        (task_id, attempt_id, task_event_seq, event_type,
+                         payload_json, trace_id)
+                    VALUES ($1::uuid, NULL, $2, 'task.cancelled', $3::jsonb, $4)
+                    """,
+                    task_id_str,
+                    seq + 1,
+                    _canonical({"reason": body.reason, "source": "api"}),
+                    row["trace_id"],
+                )
+            await conn.execute(
+                """
+                INSERT INTO audit.audit_events
+                    (actor_type, actor_id, action, resource_type, resource_id,
+                     decision, metadata_json, trace_id)
+                VALUES ('user', $1::uuid, 'task.cancel', 'task', $2,
+                        'allowed', $3::jsonb, $4)
+                """,
+                principal["id"],
+                task_id_str,
+                _canonical({
+                    "reason": body.reason,
+                    "expected_version": body.expected_version,
+                    "target_status": target_status,
+                }),
+                row["trace_id"],
+            )
+    log_event(
+        logger,
+        logging.INFO,
+        "task.cancel_requested",
+        request_id=request.state.request_id,
+        trace_id=row["trace_id"],
+        task_id=task_id_str,
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id_str,
+            "status": target_status,
+            "cancel_requested": True,
+            "version": row["version"],
+            "links": {
+                "self": f"/api/v1/tasks/{task_id_str}",
+                "events": f"/api/v1/tasks/{task_id_str}/events",
+            },
+        },
+    )
+
+
 @router.get("")
 async def list_tasks(
     request: Request,
@@ -412,11 +592,33 @@ async def list_tasks(
     if created_after and created_before and created_after >= created_before:
         raise ApiError(400, "INVALID_REQUEST", "created_after must be before created_before")
 
+    # Project a durable cancellation request onto the externally visible
+    # status until the Worker state machine materializes the column.
+    effective_status = f"""
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = 'task.cancelled'
+            ) THEN 'cancelled'
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = '{CANCEL_REQUEST_EVENT}'
+            ) AND status IN ('queued', 'retry_wait') THEN 'cancelled'
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = '{CANCEL_REQUEST_EVENT}'
+            ) AND status IN ('running', 'recovering', 'cancelling') THEN 'cancelling'
+            ELSE status
+        END
+    """
     conditions = ["owner_user_id = $1::uuid"]
     args: list[Any] = [principal["id"]]
     if status is not None:
         args.append(status)
-        conditions.append(f"status = ${len(args)}")
+        conditions.append(f"({effective_status}) = ${len(args)}")
     if created_after is not None:
         args.append(created_after.astimezone(UTC))
         conditions.append(f"created_at >= ${len(args)}")
@@ -426,7 +628,9 @@ async def list_tasks(
     args.extend([limit + 1, offset])
     async with request.app.state.connect() as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS task_id, status, task_type, created_at, updated_at, version "
+            "SELECT id::text AS task_id, "
+            f"({effective_status}) AS status, "
+            "task_type, created_at, updated_at, version "
             "FROM runtime.tasks WHERE " + " AND ".join(conditions) +
             f" ORDER BY created_at DESC, id DESC LIMIT ${len(args)-1} OFFSET ${len(args)}",
             *args,
@@ -449,29 +653,77 @@ async def get_task(
     async with request.app.state.connect() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id::text AS task_id, task_type, status, version,
-                   current_attempt_no, result_json, error_code, error_message,
-                   created_at, updated_at, completed_at
-            FROM runtime.tasks
-            WHERE id = $1::uuid AND owner_user_id = $2::uuid
+            SELECT task.id::text AS task_id, task.task_type, task.status,
+                   task.version, task.current_attempt_no, task.result_json,
+                   task.region_scope_json,
+                   task.error_code, task.error_message, task.created_at,
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements_text(task.region_scope_json)
+                            AS scope(region_code)
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM identity.region_grants AS grant_row
+                           WHERE grant_row.user_id = task.owner_user_id
+                             AND grant_row.region_code = scope.region_code
+                             AND grant_row.revoked_at IS NULL
+                             AND grant_row.permission IN ('read', 'admin')
+                       )
+                   ) AS live_region_access,
+                   task.updated_at, task.completed_at,
+                   EXISTS (
+                       SELECT 1 FROM runtime.task_events AS event
+                       WHERE event.task_id = task.id
+                         AND event.event_type = $3
+                   ) AS cancel_requested,
+                   EXISTS (
+                       SELECT 1 FROM runtime.task_events AS event
+                       WHERE event.task_id = task.id
+                         AND event.event_type = 'task.cancelled'
+                   ) AS cancel_committed
+            FROM runtime.tasks AS task
+            WHERE task.id = $1::uuid AND task.owner_user_id = $2::uuid
             """,
             str(task_id),
             principal["id"],
+            CANCEL_REQUEST_EVENT,
         )
     if row is None:
         raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
     result = dict(row)
+    live_region_access = result["live_region_access"]
+    stored_result = _json_value(result["result_json"])
+    if not live_region_access:
+        # Authorization snapshots document the grant at creation time only.
+        # Stored result and error details remain available only while every
+        # task region has a live read/admin grant for the owner.
+        stored_result = None
+    # The request event is durable immediately; the Worker state machine
+    # materializes the status column shortly after. Project the externally
+    # visible state so clients never observe a cancelled Task as runnable.
+    status = result["status"]
+    if result["cancel_committed"]:
+        status = "cancelled"
+    elif result["cancel_requested"]:
+        if status in {"queued", "retry_wait"}:
+            status = "cancelled"
+        elif status in {"running", "recovering", "cancelling"}:
+            status = "cancelling"
     return {
         "task_id": result["task_id"],
         "task_type": result["task_type"],
-        "status": result["status"],
+        "status": status,
+        "cancel_requested": result["cancel_requested"],
         "version": result["version"],
         "current_attempt_no": result["current_attempt_no"],
         "progress": {"current_step": None, "completed_steps": 0, "total_steps": 4},
-        "result": _json_value(result["result_json"]),
+        "result": stored_result,
         "error": (
             {"code": result["error_code"], "message": result["error_message"]}
-            if result["error_code"] is not None or result["error_message"] is not None
+            if live_region_access
+            and (
+                result["error_code"] is not None
+                or result["error_message"] is not None
+            )
             else None
         ),
         "created_at": result["created_at"],

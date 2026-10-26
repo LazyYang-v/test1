@@ -28,6 +28,9 @@ class WorkerSettings(BaseSettings):
     heartbeat_interval_seconds: float = Field(default=5.0, gt=0)
     lease_seconds: float = Field(default=30.0, gt=0)
     poll_interval_seconds: float = Field(default=1.0, gt=0)
+    cancel_poll_interval_seconds: float = Field(default=0.2, gt=0)
+    retry_base_delay_seconds: float = Field(default=30.0, ge=0)
+    retry_jitter_seconds: float = Field(default=5.0, ge=0)
     max_model_repairs: int = Field(default=2, ge=0, le=5)
     model_timeout_seconds: float = Field(default=60.0, gt=0)
     model_provider: str = "fake"

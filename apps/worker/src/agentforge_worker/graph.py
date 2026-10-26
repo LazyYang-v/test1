@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -67,13 +68,14 @@ class RuntimeModelRecorder:
         agent_version_id: str,
         provider: str,
         model_name: str,
+        trace_id: str | None = None,
     ) -> None:
         self._pool = pool
         self._lease = lease
         self._agent_version_id = agent_version_id
         self._provider = provider
         self._model_name = model_name
-        self._trace_id = lease.trace_id
+        self._trace_id = trace_id or lease.trace_id
 
     async def record_started(self, invocation_key: str, request: ModelRequest) -> None:
         with span(
@@ -161,6 +163,16 @@ class AnalysisGraph:
     async def run(self, lease: AttemptLease) -> dict[str, Any]:
         task = await self._store.load_task(lease.task_id)
         agent = await self._store.load_agent(task["agent_version_id"])
+        lease = AttemptLease(
+            attempt_id=lease.attempt_id,
+            task_id=lease.task_id,
+            attempt_no=lease.attempt_no,
+            worker_id=lease.worker_id,
+            lease_token=lease.lease_token,
+            fencing_epoch=lease.fencing_epoch,
+            lease_expires_at=lease.lease_expires_at,
+            trace_id=task["trace_id"],
+        )
         if agent["graph_key"] != "metrics-v1":
             raise UnsupportedGraphError(
                 f"unsupported graph_key {agent['graph_key']!r}"
@@ -171,11 +183,14 @@ class AnalysisGraph:
             agent_version_id=task["agent_version_id"],
             provider=agent["provider"],
             model_name=agent["model_name"],
+            trace_id=task["trace_id"],
         )
         model_timeout_seconds = self._model_timeout_seconds(agent)
         max_output_tokens = agent.get("max_output_tokens")
 
         async def plan_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
+
             async def work() -> dict[str, Any]:
                 request = ModelRequest(
                     messages=self._plan_messages(task),
@@ -200,6 +215,7 @@ class AnalysisGraph:
                     PLAN_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
+                    before_call=lambda: self._require_live(lease),
                 )
                 return content
 
@@ -214,6 +230,7 @@ class AnalysisGraph:
             }
 
         async def execute_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             plan = state["plan"]
 
             async def work() -> dict[str, Any]:
@@ -257,6 +274,7 @@ class AnalysisGraph:
             }
 
         async def compose_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             evidences = await self._store.load_evidences(task["task_id"])
             summaries = [self._evidence_summary(evidence) for evidence in evidences]
             evidence_ids = [evidence["evidence_id"] for evidence in evidences]
@@ -287,6 +305,7 @@ class AnalysisGraph:
                     COMPOSE_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
+                    before_call=lambda: self._require_live(lease),
                 )
                 return content
 
@@ -301,6 +320,7 @@ class AnalysisGraph:
             }
 
         async def validate_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             compose = state["compose"]
 
             async def work() -> dict[str, Any]:
@@ -357,6 +377,22 @@ class AnalysisGraph:
         )
         return final_state["report"]
 
+    async def _require_live(self, lease: AttemptLease) -> None:
+        """Node-boundary guard: stop before any new model/tool call."""
+        reason = await self._store.stop_reason(lease)
+        if reason == "DEADLINE_EXCEEDED":
+            raise TaskNotRunningError(
+                "DEADLINE_EXCEEDED", "task deadline has passed"
+            )
+        if reason == "CANCELLED":
+            raise TaskNotRunningError(
+                "CANCELLED", "task cancellation was requested"
+            )
+        if reason == "LEASE_LOST":
+            raise LeaseLostError(
+                "attempt lease, identity, or fencing epoch is stale"
+            )
+
     async def _step(
         self,
         lease: AttemptLease,
@@ -371,6 +407,9 @@ class AnalysisGraph:
             return confirmed.result
         try:
             result = await work()
+        except asyncio.CancelledError:
+            # Cooperative cancellation must not be converted into a failed step.
+            raise
         except BaseException as error:
             try:
                 await self._store.fail_step(

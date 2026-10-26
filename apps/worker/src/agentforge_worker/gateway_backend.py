@@ -93,20 +93,25 @@ class PostgresToolGatewayBackend:
                 )
             )
 
-    async def lease_is_valid(self, context: ToolContext) -> bool:
+    @staticmethod
+    def _lease(context: ToolContext):
         from agentforge_runtime.contracts import AttemptLease
 
-        return await self._store.lease_is_valid(
-            AttemptLease(
-                attempt_id=context.attempt_id,
-                task_id=context.task_id,
-                attempt_no=context.fencing_epoch,
-                worker_id="",
-                lease_token=context.lease_token,
-                fencing_epoch=context.fencing_epoch,
-                trace_id=context.trace_id,
-            )
+        return AttemptLease(
+            attempt_id=context.attempt_id,
+            task_id=context.task_id,
+            attempt_no=context.fencing_epoch,
+            worker_id="",
+            lease_token=context.lease_token,
+            fencing_epoch=context.fencing_epoch,
+            trace_id=context.trace_id,
         )
+
+    async def lease_is_valid(self, context: ToolContext) -> bool:
+        return await self._store.lease_is_valid(self._lease(context))
+
+    async def stop_reason(self, context: ToolContext) -> str | None:
+        return await self._store.stop_reason(self._lease(context))
 
     async def accepted_call_count(self, task_id: str, tool_version_id: str) -> int:
         async with self._pool.acquire() as conn:
@@ -275,7 +280,12 @@ class PostgresToolGatewayBackend:
                 task = await conn.fetchrow(
                     """
                     SELECT status, cancel_requested_at, trace_id,
-                           (deadline_at IS NOT NULL AND deadline_at <= now()) AS expired
+                           (deadline_at IS NOT NULL AND deadline_at <= now()) AS expired,
+                           EXISTS (
+                               SELECT 1 FROM runtime.task_events AS event
+                               WHERE event.task_id = runtime.tasks.id
+                                 AND event.event_type = 'task.cancel.requested'
+                           ) AS cancel_event
                     FROM runtime.tasks WHERE id = $1::uuid FOR UPDATE
                     """,
                     context.task_id,
@@ -297,6 +307,7 @@ class PostgresToolGatewayBackend:
                     or attempt is None
                     or task["status"] != "running"
                     or task["cancel_requested_at"] is not None
+                    or task["cancel_event"]
                     or task["expired"]
                 ):
                     return None
