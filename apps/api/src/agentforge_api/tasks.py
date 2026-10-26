@@ -12,16 +12,39 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
+import jwt
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+_SSE_BEARER = HTTPBearer(auto_error=False)
 _EVENT_CHANNEL = "agentforge_task_events"
 _EVENT_POLL_SECONDS = 10.0
 _MAX_EVENT_ID = 9_223_372_036_854_775_807
+_EVENT_DB_TIMEOUT_SECONDS = 1.0
+_EVENT_REAUTH_SECONDS = 30.0
+_EVENT_RETRY_SECONDS = 1.0
+_TRANSIENT_EVENT_DB_ERRORS = (
+    OSError,
+    asyncpg.InterfaceError,
+    asyncpg.PostgresConnectionError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.TooManyConnectionsError,
+    asyncpg.AdminShutdownError,
+    asyncpg.CrashShutdownError,
+    asyncpg.QueryCanceledError,
+    asyncio.TimeoutError,
+)
+
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+CANCEL_REQUEST_EVENT = "task.cancel.requested"
+CANCELLABLE_TASK_STATUSES = frozenset(
+    {"queued", "retry_wait", "running", "recovering"}
+)
 
 
 def _canonical(value: Any) -> str:
@@ -162,6 +185,21 @@ class CreateTaskRequest(BaseModel):
             "input": self.input.canonical_json(),
             "execution": self.execution.model_dump(mode="json"),
         }
+
+
+class CancelTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2000)
+    expected_version: int = Field(ge=1)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be blank")
+        return value
 
 
 def _task_response(
@@ -393,6 +431,159 @@ async def create_task(
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 
+@router.post("/{task_id}/cancel", status_code=202)
+async def cancel_task(
+    task_id: uuid.UUID,
+    body: CancelTaskRequest,
+    request: Request,
+    principal: dict[str, Any] = Depends(current_principal),
+):
+    """Record an owner-scoped, optimistic-version cancellation request.
+
+    The API role is intentionally append-only for Runtime state: it persists
+    the request event inside a per-Task advisory lock and the Worker state
+    machine materializes ``cancelling``/``cancelled``. This keeps terminal
+    transitions fenced by the owning attempt and preserves the least-privilege
+    role boundary (the API never gains UPDATE on ``runtime.tasks``).
+    """
+    task_id_str = str(task_id)
+    async with request.app.state.connect() as conn:
+        async with conn.transaction():
+            await conn.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                task_id_str,
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT task.status, task.version,
+                       (task.deadline_at IS NOT NULL
+                        AND task.deadline_at <= now()) AS expired,
+                       EXISTS (
+                           SELECT 1 FROM runtime.task_events AS event
+                           WHERE event.task_id = task.id
+                             AND event.event_type = $3
+                       ) AS cancel_requested
+                FROM runtime.tasks AS task
+                WHERE task.id = $1::uuid AND task.owner_user_id = $2::uuid
+                """,
+                task_id_str,
+                principal["id"],
+                CANCEL_REQUEST_EVENT,
+            )
+            if row is None:
+                raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+            if row["status"] in TERMINAL_TASK_STATUSES:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task is already in a terminal state",
+                    details={"status": row["status"]},
+                )
+            if row["version"] != body.expected_version:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "expected_version does not match the current task version",
+                    details={"current_version": row["version"]},
+                )
+            if row["status"] not in CANCELLABLE_TASK_STATUSES:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task cannot be cancelled from its current state",
+                    details={"status": row["status"]},
+                )
+            if row["expired"]:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task deadline has already passed",
+                )
+            if row["cancel_requested"]:
+                raise ApiError(
+                    409,
+                    "INVALID_STATE_TRANSITION",
+                    "Task cancellation is already in progress",
+                )
+
+            # A Task that is not executing has no attempt that must stop, so
+            # cancellation is decided immediately. A running Task enters
+            # ``cancelling`` and the owning worker performs the fenced terminal
+            # transition. The API role is append-only for Runtime state; the
+            # Worker scanner materializes the status column shortly after.
+            target_status = (
+                "cancelling" if row["status"] == "running" else "cancelled"
+            )
+            seq = await conn.fetchval(
+                "SELECT COALESCE(MAX(task_event_seq), 0) + 1 "
+                "FROM runtime.task_events WHERE task_id = $1::uuid",
+                task_id_str,
+            )
+            await conn.execute(
+                """
+                INSERT INTO runtime.task_events
+                    (task_id, attempt_id, task_event_seq, event_type,
+                     payload_json, trace_id)
+                VALUES ($1::uuid, NULL, $2, $3, $4::jsonb, $5)
+                """,
+                task_id_str,
+                seq,
+                CANCEL_REQUEST_EVENT,
+                _canonical({
+                    "reason": body.reason,
+                    "expected_version": body.expected_version,
+                    "requested_by": principal["id"],
+                    "target_status": target_status,
+                }),
+                request.state.request_id,
+            )
+            await _notify_task_event(conn, task_id_str, seq)
+            if target_status == "cancelled":
+                await conn.execute(
+                    """
+                    INSERT INTO runtime.task_events
+                        (task_id, attempt_id, task_event_seq, event_type,
+                         payload_json, trace_id)
+                    VALUES ($1::uuid, NULL, $2, 'task.cancelled', $3::jsonb, $4)
+                    """,
+                    task_id_str,
+                    seq + 1,
+                    _canonical({"reason": body.reason, "source": "api"}),
+                    request.state.request_id,
+                )
+                await _notify_task_event(conn, task_id_str, seq + 1)
+            await conn.execute(
+                """
+                INSERT INTO audit.audit_events
+                    (actor_type, actor_id, action, resource_type, resource_id,
+                     decision, metadata_json, trace_id)
+                VALUES ('user', $1::uuid, 'task.cancel', 'task', $2,
+                        'allowed', $3::jsonb, $4)
+                """,
+                principal["id"],
+                task_id_str,
+                _canonical({
+                    "reason": body.reason,
+                    "expected_version": body.expected_version,
+                    "target_status": target_status,
+                }),
+                request.state.request_id,
+            )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id_str,
+            "status": target_status,
+            "cancel_requested": True,
+            "version": row["version"],
+            "links": {
+                "self": f"/api/v1/tasks/{task_id_str}",
+                "events": f"/api/v1/tasks/{task_id_str}/events",
+            },
+        },
+    )
+
+
 @router.get("")
 async def list_tasks(
     request: Request,
@@ -414,11 +605,33 @@ async def list_tasks(
     if created_after and created_before and created_after >= created_before:
         raise ApiError(400, "INVALID_REQUEST", "created_after must be before created_before")
 
+    # Project a durable cancellation request onto the externally visible
+    # status until the Worker state machine materializes the column.
+    effective_status = f"""
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = 'task.cancelled'
+            ) THEN 'cancelled'
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = '{CANCEL_REQUEST_EVENT}'
+            ) AND status IN ('queued', 'retry_wait') THEN 'cancelled'
+            WHEN EXISTS (
+                SELECT 1 FROM runtime.task_events AS event
+                WHERE event.task_id = runtime.tasks.id
+                  AND event.event_type = '{CANCEL_REQUEST_EVENT}'
+            ) AND status IN ('running', 'recovering', 'cancelling') THEN 'cancelling'
+            ELSE status
+        END
+    """
     conditions = ["owner_user_id = $1::uuid"]
     args: list[Any] = [principal["id"]]
     if status is not None:
         args.append(status)
-        conditions.append(f"status = ${len(args)}")
+        conditions.append(f"({effective_status}) = ${len(args)}")
     if created_after is not None:
         args.append(created_after.astimezone(UTC))
         conditions.append(f"created_at >= ${len(args)}")
@@ -428,7 +641,9 @@ async def list_tasks(
     args.extend([limit + 1, offset])
     async with request.app.state.connect() as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS task_id, status, task_type, created_at, updated_at, version "
+            "SELECT id::text AS task_id, "
+            f"({effective_status}) AS status, "
+            "task_type, created_at, updated_at, version "
             "FROM runtime.tasks WHERE " + " AND ".join(conditions) +
             f" ORDER BY created_at DESC, id DESC LIMIT ${len(args)-1} OFFSET ${len(args)}",
             *args,
@@ -462,10 +677,19 @@ def _sse_frame(row: asyncpg.Record) -> bytes:
     ).encode("utf-8")
 
 
-async def _task_event_stream(request: Request, task_id: str, cursor: int):
+async def _task_event_stream(
+    request: Request,
+    task_id: str,
+    cursor: int,
+    *,
+    user_id: str,
+    token_version: int,
+    token_expiry: int,
+):
     """Replay persisted events and use LISTEN only to wake up the DB reader."""
     listener = None
     wakeup = asyncio.Event()
+    next_reauthorization = 0.0
 
     def on_notification(_connection, _process_id, _channel, payload):
         try:
@@ -482,52 +706,82 @@ async def _task_event_stream(request: Request, task_id: str, cursor: int):
 
     try:
         while True:
+            if int(datetime.now(UTC).timestamp()) >= token_expiry:
+                break
+
+            now_monotonic = asyncio.get_running_loop().time()
+            if now_monotonic >= next_reauthorization:
+                # No event rows are released after account, token, ownership, or
+                # live grant revocation is observed. The same query below repeats
+                # this check before reading each persisted batch.
+                pass
+
             if listener is None or listener.is_closed():
                 if listener is not None:
                     await listener.close()
                 try:
                     listener = await asyncpg.connect(
                         request.app.state.settings.api_db_dsn,
-                        timeout=5,
-                        server_settings={"application_name": "agentforge-sse-listener-starting"},
+                        timeout=_EVENT_DB_TIMEOUT_SECONDS,
+                        server_settings={
+                            "application_name": "agentforge-sse-listener-starting",
+                            "statement_timeout": "1000",
+                        },
                     )
                     await listener.add_listener(_EVENT_CHANNEL, on_notification)
                     await listener.execute("SET application_name = 'agentforge-sse-listener'")
                     listener.add_termination_listener(on_listener_termination)
-                except (
-                    OSError,
-                    asyncpg.InterfaceError,
-                    asyncpg.PostgresConnectionError,
-                    asyncio.TimeoutError,
-                ):
+                except _TRANSIENT_EVENT_DB_ERRORS:
                     if listener is not None:
                         await listener.close()
                     listener = None
 
             wakeup.clear()
             try:
-                async with request.app.state.connect() as conn:
+                connect_events = getattr(
+                    request.app.state,
+                    "connect_events",
+                    request.app.state.connect,
+                )
+                async with connect_events() as conn:
+                    await conn.execute("SET statement_timeout = 900")
                     rows = await conn.fetch(
                         """
-                        SELECT task_event_seq, event_type, payload_json
-                        FROM runtime.task_events
-                        WHERE task_id = $1::uuid AND task_event_seq > $2
-                        ORDER BY task_event_seq
+                        SELECT event.task_event_seq, event.event_type, event.payload_json,
+                               task.owner_user_id = $2::uuid AS owns_task,
+                               user_row.status = 'active' AS user_active,
+                               user_row.token_version = $3 AS token_current,
+                               NOT EXISTS (
+                                   SELECT 1
+                                   FROM jsonb_array_elements_text(task.region_scope_json)
+                                        AS region(region_code)
+                                   WHERE NOT EXISTS (
+                                       SELECT 1 FROM identity.region_grants AS grant_row
+                                       WHERE grant_row.region_code = region.region_code
+                                         AND grant_row.user_id = task.owner_user_id
+                                         AND grant_row.revoked_at IS NULL
+                                         AND grant_row.permission IN ('read', 'admin')
+                                   )
+                               ) AS has_region_access
+                        FROM runtime.tasks AS task
+                        JOIN identity.users AS user_row ON user_row.id = $2::uuid
+                        LEFT JOIN runtime.task_events AS event
+                          ON event.task_id = task.id AND event.task_event_seq > $4
+                        WHERE task.id = $1::uuid
+                        ORDER BY event.task_event_seq
+                        LIMIT 100
                         """,
                         task_id,
+                        user_id,
+                        token_version,
                         cursor,
                     )
-            except (
-                OSError,
-                asyncpg.InterfaceError,
-                asyncpg.PostgresConnectionError,
-                asyncio.TimeoutError,
-            ):
-                # A temporary query-connection failure must not end the client
-                # stream; retry from the last delivered sequence after a short wait.
+            except _TRANSIENT_EVENT_DB_ERRORS:
+                # A temporary database failure must not end the client stream.
                 if listener is not None:
                     await listener.close()
                     listener = None
+                wakeup.clear()
                 try:
                     await asyncio.wait_for(wakeup.wait(), timeout=1.0)
                 except TimeoutError:
@@ -535,8 +789,15 @@ async def _task_event_stream(request: Request, task_id: str, cursor: int):
                 yield b": keep-alive\n\n"
                 continue
 
-            if rows:
-                for row in rows:
+            if not rows or not all(
+                rows[0][field]
+                for field in ("owns_task", "user_active", "token_current", "has_region_access")
+            ):
+                break
+
+            event_rows = [row for row in rows if row["task_event_seq"] is not None]
+            if event_rows:
+                for row in event_rows:
                     seq = row["task_event_seq"]
                     if seq <= cursor:
                         continue
@@ -544,8 +805,6 @@ async def _task_event_stream(request: Request, task_id: str, cursor: int):
                     yield _sse_frame(row)
                 continue
 
-            # Notifications arriving during the query set the wakeup event;
-            # clear only before querying so the commit/query/wait race is closed.
             poll_seconds = min(
                 _EVENT_POLL_SECONDS,
                 max(0.01, float(getattr(request.app.state, "event_poll_seconds", _EVENT_POLL_SECONDS))),
@@ -567,6 +826,7 @@ async def stream_task_events(
     task_id: uuid.UUID,
     request: Request,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_SSE_BEARER),
     principal: dict[str, Any] = Depends(current_principal),
 ):
     async with request.app.state.connect() as conn:
@@ -578,9 +838,44 @@ async def stream_task_events(
     if not owns_task:
         raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
     cursor = _event_cursor(last_event_id)
+    try:
+        claims = jwt.decode(
+            credentials.credentials if credentials is not None else "",
+            request.app.state.settings.jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "token_version"]},
+        )
+        token_version = int(claims["token_version"])
+        token_expiry = int(claims["exp"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise ApiError(401, "UNAUTHENTICATED", "Authentication required") from None
+
+    limiter = request.app.state.stream_limiter
+    if not limiter.try_acquire(principal["id"]):
+        raise ApiError(
+            429,
+            "RATE_LIMITED",
+            "Too many active event streams",
+            retryable=True,
+            headers={"Retry-After": "1"},
+        )
+
+    async def stream_body():
+        try:
+            async for frame in _task_event_stream(
+                request,
+                str(task_id),
+                cursor,
+                user_id=principal["id"],
+                token_version=token_version,
+                token_expiry=token_expiry,
+            ):
+                yield frame
+        finally:
+            limiter.release(principal["id"])
 
     return StreamingResponse(
-        _task_event_stream(request, str(task_id), cursor),
+        stream_body(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -598,29 +893,77 @@ async def get_task(
     async with request.app.state.connect() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id::text AS task_id, task_type, status, version,
-                   current_attempt_no, result_json, error_code, error_message,
-                   created_at, updated_at, completed_at
-            FROM runtime.tasks
-            WHERE id = $1::uuid AND owner_user_id = $2::uuid
+            SELECT task.id::text AS task_id, task.task_type, task.status,
+                   task.version, task.current_attempt_no, task.result_json,
+                   task.region_scope_json,
+                   task.error_code, task.error_message, task.created_at,
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements_text(task.region_scope_json)
+                            AS scope(region_code)
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM identity.region_grants AS grant_row
+                           WHERE grant_row.user_id = task.owner_user_id
+                             AND grant_row.region_code = scope.region_code
+                             AND grant_row.revoked_at IS NULL
+                             AND grant_row.permission IN ('read', 'admin')
+                       )
+                   ) AS live_region_access,
+                   task.updated_at, task.completed_at,
+                   EXISTS (
+                       SELECT 1 FROM runtime.task_events AS event
+                       WHERE event.task_id = task.id
+                         AND event.event_type = $3
+                   ) AS cancel_requested,
+                   EXISTS (
+                       SELECT 1 FROM runtime.task_events AS event
+                       WHERE event.task_id = task.id
+                         AND event.event_type = 'task.cancelled'
+                   ) AS cancel_committed
+            FROM runtime.tasks AS task
+            WHERE task.id = $1::uuid AND task.owner_user_id = $2::uuid
             """,
             str(task_id),
             principal["id"],
+            CANCEL_REQUEST_EVENT,
         )
     if row is None:
         raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
     result = dict(row)
+    live_region_access = result["live_region_access"]
+    stored_result = _json_value(result["result_json"])
+    if not live_region_access:
+        # Authorization snapshots document the grant at creation time only.
+        # Stored result and error details remain available only while every
+        # task region has a live read/admin grant for the owner.
+        stored_result = None
+    # The request event is durable immediately; the Worker state machine
+    # materializes the status column shortly after. Project the externally
+    # visible state so clients never observe a cancelled Task as runnable.
+    status = result["status"]
+    if result["cancel_committed"]:
+        status = "cancelled"
+    elif result["cancel_requested"]:
+        if status in {"queued", "retry_wait"}:
+            status = "cancelled"
+        elif status in {"running", "recovering", "cancelling"}:
+            status = "cancelling"
     return {
         "task_id": result["task_id"],
         "task_type": result["task_type"],
-        "status": result["status"],
+        "status": status,
+        "cancel_requested": result["cancel_requested"],
         "version": result["version"],
         "current_attempt_no": result["current_attempt_no"],
         "progress": {"current_step": None, "completed_steps": 0, "total_steps": 4},
-        "result": _json_value(result["result_json"]),
+        "result": stored_result,
         "error": (
             {"code": result["error_code"], "message": result["error_message"]}
-            if result["error_code"] is not None or result["error_message"] is not None
+            if live_region_access
+            and (
+                result["error_code"] is not None
+                or result["error_message"] is not None
+            )
             else None
         ),
         "created_at": result["created_at"],

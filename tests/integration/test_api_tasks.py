@@ -1000,7 +1000,7 @@ async def test_retirement_wins_lock_and_creation_rechecks_publication(seeded_tas
             await observer.close()
 
 
-async def _open_asgi_stream(app, path, headers):
+async def _open_asgi_stream(app, path, headers, *, on_start=None):
     messages = []
     request_sent = False
     disconnected = asyncio.Event()
@@ -1066,11 +1066,22 @@ async def _open_asgi_stream(app, path, headers):
         disconnected.set()
         await asyncio.wait_for(task, timeout=5)
 
+    async def wait_for_response_start():
+        async with asyncio.timeout(5):
+            async with changed:
+                await changed.wait_for(
+                    lambda: any(
+                        message["type"] == "http.response.start" for message in messages
+                    ) or task.done()
+                )
+        assert not task.done(), "SSE request ended before response start"
+
     return {
         "messages": messages,
         "body": body,
         "wait_for_events": wait_for_events,
         "wait_for_heartbeat": wait_for_heartbeat,
+        "wait_for_response_start": wait_for_response_start,
         "close": close,
         "task": task,
     }
@@ -1122,6 +1133,42 @@ async def _run_asgi_stream(app, path, headers, *, event_count):
         return response_start["status"], dict(response_start["headers"]), stream["body"]()
     finally:
         await stream["close"]()
+
+
+async def test_task_events_stream_limit_returns_retry_after(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-limiter",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+
+    class SaturatedLimiter:
+        def try_acquire(self, _principal_id):
+            return False
+
+        def release(self, _principal_id):
+            raise AssertionError("a rejected stream must not release a permit")
+
+    app.state.stream_limiter = SaturatedLimiter()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            f"/api/v1/tasks/{task_id}/events",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["error"]["code"] == "RATE_LIMITED"
 
 
 async def test_task_events_stream_requires_authentication(seeded_tasks_db):

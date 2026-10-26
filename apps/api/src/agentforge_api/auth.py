@@ -30,6 +30,7 @@ class ApiError(Exception):
         *,
         retryable: bool = False,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -37,6 +38,7 @@ class ApiError(Exception):
         self.message = message
         self.retryable = retryable
         self.details = details or {}
+        self.headers = headers or {}
 
 
 def create_access_token(

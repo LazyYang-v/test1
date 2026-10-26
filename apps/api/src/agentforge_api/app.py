@@ -26,8 +26,9 @@ from agentforge_api.tasks import router as task_router
 
 
 @asynccontextmanager
-async def _database_connection(dsn: str):
-    conn = await asyncpg.connect(dsn)
+async def _database_connection(dsn: str, *, timeout: float | None = None):
+    connect_kwargs = {} if timeout is None else {"timeout": timeout}
+    conn = await asyncpg.connect(dsn, **connect_kwargs)
     try:
         yield conn
     finally:
@@ -112,6 +113,7 @@ def _error_response(request: Request, error: ApiError) -> JSONResponse:
             },
             "request_id": request.state.request_id,
         },
+        headers=error.headers,
     )
 
 
@@ -122,6 +124,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.settings = app_settings
         app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
+        app.state.connect_events = lambda: _database_connection(
+            app_settings.api_db_dsn, timeout=1.0
+        )
         yield
 
     app = FastAPI(title="AgentForge API", lifespan=lifespan)
@@ -129,6 +134,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ASGI tests may use HTTPX's ASGITransport without starting lifespan.
     app.state.settings = app_settings
     app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
+    app.state.connect_events = lambda: _database_connection(
+        app_settings.api_db_dsn, timeout=1.0
+    )
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):

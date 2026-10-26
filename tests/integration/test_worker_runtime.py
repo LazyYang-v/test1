@@ -14,6 +14,7 @@ from agentforge_runtime.errors import LeaseLostError
 from agentforge_runtime.store import RuntimeStore
 from agentforge_worker.config import WorkerSettings
 from agentforge_worker.worker import Worker
+from test_api_tasks import _open_asgi_stream, _wait_for_sse_listener
 
 from worker_support import (
     complete_dataset_load,
@@ -25,6 +26,8 @@ from worker_support import (
     fetch_task,
     seed_agent,
     wait_until,
+    app_for,
+    token,
 )
 
 pytestmark = pytest.mark.integration
@@ -55,6 +58,30 @@ async def _prepared_task(db: dict, **seed_kwargs) -> str:
     await seed_agent(db, **seed_kwargs)
     await complete_dataset_load(db)
     return await create_task_via_api(db)
+
+
+async def test_worker_event_is_delivered_to_live_sse_subscriber(migrated_db):
+    db = migrated_db
+    task_id = await _prepared_task(db)
+    app = app_for(db)
+    app.state.event_poll_seconds = 10
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {token()}", "Last-Event-ID": "1"},
+    )
+    await _wait_for_sse_listener(db)
+    pool = await _pool(db)
+    store = RuntimeStore(pool, worker_id="worker-sse", lease_seconds=30)
+    try:
+        lease = await store.claim()
+        assert lease is not None
+        await asyncio.wait_for(stream["wait_for_events"](1), timeout=2)
+        assert b'id: 2\nevent: task.attempt.started\ndata: ' in stream["body"]()
+        assert b'"attempt_no":1' in stream["body"]()
+    finally:
+        await store.close()
+        await stream["close"]()
 
 
 async def test_two_concurrent_workers_claim_exactly_one_attempt(migrated_db):
