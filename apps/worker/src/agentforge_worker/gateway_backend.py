@@ -12,6 +12,7 @@ import asyncpg
 
 from agentforge_harness.gateway import ToolContext, ToolDescriptor
 from agentforge_runtime.store import RuntimeStore
+from agentforge_core.observability import span
 
 
 def _canonical(value: Any) -> str:
@@ -92,19 +93,25 @@ class PostgresToolGatewayBackend:
                 )
             )
 
-    async def lease_is_valid(self, context: ToolContext) -> bool:
+    @staticmethod
+    def _lease(context: ToolContext):
         from agentforge_runtime.contracts import AttemptLease
 
-        return await self._store.lease_is_valid(
-            AttemptLease(
-                attempt_id=context.attempt_id,
-                task_id=context.task_id,
-                attempt_no=context.fencing_epoch,
-                worker_id="",
-                lease_token=context.lease_token,
-                fencing_epoch=context.fencing_epoch,
-            )
+        return AttemptLease(
+            attempt_id=context.attempt_id,
+            task_id=context.task_id,
+            attempt_no=context.fencing_epoch,
+            worker_id="",
+            lease_token=context.lease_token,
+            fencing_epoch=context.fencing_epoch,
+            trace_id=context.trace_id,
         )
+
+    async def lease_is_valid(self, context: ToolContext) -> bool:
+        return await self._store.lease_is_valid(self._lease(context))
+
+    async def stop_reason(self, context: ToolContext) -> str | None:
+        return await self._store.stop_reason(self._lease(context))
 
     async def accepted_call_count(self, task_id: str, tool_version_id: str) -> int:
         async with self._pool.acquire() as conn:
@@ -154,6 +161,26 @@ class PostgresToolGatewayBackend:
         code: str,
         detail: str,
     ) -> None:
+        with span(
+            "tool.rejected",
+            trace_id=context.trace_id,
+            task_id=context.task_id,
+            attempt_id=context.attempt_id,
+        ):
+            await self._reject(
+                context, descriptor, invocation_key, request_hash, request_json, code, detail
+            )
+
+    async def _reject(
+        self,
+        context: ToolContext,
+        descriptor: ToolDescriptor | None,
+        invocation_key: str,
+        request_hash: str,
+        request_json: dict[str, Any],
+        code: str,
+        detail: str,
+    ) -> None:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 if descriptor is not None:
@@ -167,7 +194,7 @@ class PostgresToolGatewayBackend:
                                 $7::jsonb, 'failed', $8, now(), $9)
                         ON CONFLICT (task_id, invocation_key) DO UPDATE
                         SET status = 'failed', error_code = EXCLUDED.error_code,
-                            finished_at = now()
+                            finished_at = now(), trace_id = EXCLUDED.trace_id
                         WHERE harness.tool_invocations.status <> 'succeeded'
                         """,
                         str(uuid.uuid4()),
@@ -218,12 +245,47 @@ class PostgresToolGatewayBackend:
             query_plan if query_plan is not None else request_json
         )
         result_hash = _hash(result)
+        with span(
+            "tool.accepted",
+            trace_id=context.trace_id,
+            task_id=context.task_id,
+            attempt_id=context.attempt_id,
+        ):
+            return await self._accept(
+                context,
+                descriptor,
+                invocation_key,
+                request_hash,
+                request_json,
+                result_json,
+                query_plan_json,
+                result_hash,
+                result,
+            )
+
+    async def _accept(
+        self,
+        context: ToolContext,
+        descriptor: ToolDescriptor,
+        invocation_key: str,
+        request_hash: str,
+        request_json: dict[str, Any],
+        result_json: str,
+        query_plan_json: str,
+        result_hash: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 task = await conn.fetchrow(
                     """
-                    SELECT status, cancel_requested_at,
-                           (deadline_at IS NOT NULL AND deadline_at <= now()) AS expired
+                    SELECT status, cancel_requested_at, trace_id,
+                           (deadline_at IS NOT NULL AND deadline_at <= now()) AS expired,
+                           EXISTS (
+                               SELECT 1 FROM runtime.task_events AS event
+                               WHERE event.task_id = runtime.tasks.id
+                                 AND event.event_type = 'task.cancel.requested'
+                           ) AS cancel_event
                     FROM runtime.tasks WHERE id = $1::uuid FOR UPDATE
                     """,
                     context.task_id,
@@ -245,6 +307,7 @@ class PostgresToolGatewayBackend:
                     or attempt is None
                     or task["status"] != "running"
                     or task["cancel_requested_at"] is not None
+                    or task["cancel_event"]
                     or task["expired"]
                 ):
                     return None

@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     jwt_ttl_seconds: int = Field(default=900, ge=1, le=900)
     live_evaluations_enabled: bool = False
     live_evaluation_call_budget_limit: int = Field(default=0, ge=0, le=1000)
+    rate_limit_per_second: float = Field(default=5.0, gt=0, le=1000)
+    rate_limit_burst: int = Field(default=30, ge=1)
+    rate_limit_max_entries: int = Field(default=10_000, ge=1)
+    rate_limit_idle_seconds: float = Field(default=3600, gt=0, le=86_400)
+    otel_enabled: bool = False
+    otel_exporter_otlp_endpoint: str | None = None
 
     @field_validator("api_db_dsn")
     @classmethod

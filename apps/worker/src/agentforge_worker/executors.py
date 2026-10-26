@@ -10,12 +10,11 @@ import asyncpg
 from agentforge_harness.gateway import ToolContext, ToolError, ToolExecution
 
 from agentforge_worker.metrics import (
-    GMV_METRIC,
-    GMV_METRIC_VERSION,
-    GMV_UNIT,
+    MetricDefinition,
+    MetricPlanner,
     QueryPlanError,
-    calculate_gmv_delta,
-    compile_gmv_query,
+    ResultNormalizer,
+    compile_metric_query,
 )
 
 
@@ -64,49 +63,74 @@ class MetricsQueryExecutor:
         self, request: dict[str, Any], context: ToolContext
     ) -> ToolExecution:
         try:
-            compiled = compile_gmv_query(
-                request,
-                region_scope=context.region_scope,
-                data_snapshot_id=context.task_snapshot_id,
-            )
+            intent = MetricPlanner.plan(request)
         except QueryPlanError as error:
             raise ToolError(error.code, str(error)) from error
+
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction(readonly=True):
-                # Belt-and-braces: the pool sets the session default, and every
-                # metrics transaction also pins a short local timeout.
+                # Both metadata and business rows use the dedicated least-
+                # privilege connection, pinned to a fixed search path/timeout.
                 await conn.execute(
                     "SELECT set_config('statement_timeout', $1, true)",
                     str(self._statement_timeout_ms),
                 )
-                row = await conn.fetchrow(compiled.sql, *compiled.parameters)
-        if row is None:  # aggregate query always returns exactly one row
-            raise RuntimeError("GMV aggregate query returned no row")
-
-        delta = calculate_gmv_delta(
-            current_value=row["current_value"],
-            previous_value=row["previous_value"],
-            current_row_count=row["current_row_count"],
-            previous_row_count=row["previous_row_count"],
-        )
+                try:
+                    definition_row = await conn.fetchrow(
+                        """
+                        SELECT metric_key, version, source_view, expression_key,
+                               allowed_dimensions, allowed_filters, aggregation,
+                               unit, time_column, status
+                        FROM business.metric_definitions
+                        WHERE metric_key = $1 AND version = $2 AND status = 'active'
+                        """,
+                        intent.metric,
+                        intent.metric_version,
+                    )
+                except asyncpg.InsufficientPrivilegeError as error:
+                    raise RuntimeError(
+                        "business_ro cannot read registered metric definitions"
+                    ) from error
+                definition = (
+                    None
+                    if definition_row is None
+                    else MetricDefinition.from_row(definition_row)
+                )
+                try:
+                    compiled = compile_metric_query(
+                        request,
+                        definition=definition,
+                        region_scope=context.region_scope,
+                        data_snapshot_id=context.task_snapshot_id,
+                    )
+                except QueryPlanError as error:
+                    raise ToolError(error.code, str(error)) from error
+                rows = await conn.fetch(compiled.sql, *compiled.parameters)
+        if len(rows) > compiled.query_plan["limit"]:
+            raise ToolError(
+                "QUERY_RESULT_LIMIT_EXCEEDED",
+                "metric query reached the configured row limit",
+            )
+        normalized = ResultNormalizer.normalize(rows)
         result = {
-            "metric": GMV_METRIC,
-            "metric_version": GMV_METRIC_VERSION,
-            "unit": GMV_UNIT,
-            "current_value": f"{delta.current_value:.2f}",
-            "previous_value": f"{delta.previous_value:.2f}",
-            "absolute_change": f"{delta.absolute_change:.2f}",
+            "metric": compiled.query_plan["metric"],
+            "metric_version": compiled.query_plan["metric_version"],
+            "unit": compiled.query_plan["unit"],
+            "current_value": f"{normalized.current_value:.2f}",
+            "previous_value": f"{normalized.previous_value:.2f}",
+            "absolute_change": f"{normalized.absolute_change:.2f}",
             "change_rate": (
                 None
-                if delta.change_rate is None
-                else f"{delta.change_rate:.4f}"
+                if normalized.change_rate is None
+                else f"{normalized.change_rate:.4f}"
             ),
-            "row_count": int(delta.current_row_count),
+            "row_count": int(normalized.row_count),
             "data_snapshot_id": context.task_snapshot_id,
         }
         query_plan = {
             **compiled.query_plan,
-            "annotations": list(delta.annotations),
+            "dimension_results": list(normalized.dimension_results),
+            "annotations": list(normalized.annotations),
         }
         return ToolExecution(result=result, query_plan=query_plan)

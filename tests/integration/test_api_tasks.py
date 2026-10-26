@@ -200,6 +200,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         )
 
     assert response.status_code == 202
+    assert response.headers["X-Request-ID"] == "task-create-request-001"
     payload = response.json()
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
@@ -215,7 +216,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         task = await conn.fetchrow(
             """
             SELECT owner_user_id::text AS owner_user_id,
-                   agent_version_id::text AS agent_version_id, status,
+                   agent_version_id::text AS agent_version_id, trace_id, status,
                    input_json, region_scope_json, authorization_snapshot,
                    data_snapshot_id, current_attempt_no, created_at
             FROM runtime.tasks WHERE id = $1::uuid
@@ -231,7 +232,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
         )
         audit = await conn.fetchrow(
             """
-            SELECT action, resource_id, decision FROM audit.audit_events
+            SELECT action, resource_id, decision, trace_id FROM audit.audit_events
             WHERE action = 'task.created' AND resource_id = $1
             """,
             task_id,
@@ -241,6 +242,7 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
 
     assert task["owner_user_id"] == USER_ID
     assert task["agent_version_id"] == AGENT_VERSION_ID
+    assert task["trace_id"] == task_id
     assert task["status"] == "queued"
     assert task["region_scope_json"] == '["CN_EAST"]'
     assert json.loads(task["authorization_snapshot"]) == [
@@ -248,12 +250,13 @@ async def test_task_creation_returns_accepted_and_persists_task_and_created_even
     ]
     assert event["task_event_seq"] == 1
     assert event["event_type"] == "task.created"
-    assert event["trace_id"] == "task-create-request-001"
+    assert event["trace_id"] == task_id
     assert (audit["action"], audit["resource_id"], audit["decision"]) == (
         "task.created",
         task_id,
         "allowed",
     )
+    assert audit["trace_id"] == task_id
     assert task["data_snapshot_id"].strip() == (
         "e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8"
     )
@@ -998,3 +1001,580 @@ async def test_retirement_wins_lock_and_creation_rechecks_publication(seeded_tas
             await _cancel_pending(create)
             await retirement.close()
             await observer.close()
+
+
+async def _open_asgi_stream(app, path, headers, *, on_start=None):
+    messages = []
+    request_sent = False
+    disconnected = asyncio.Event()
+    changed = asyncio.Condition()
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+        async with changed:
+            changed.notify_all()
+
+    raw_headers = [(key.lower().encode(), value.encode()) for key, value in headers.items()]
+    path_bytes = path.encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path_bytes,
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw_headers,
+        "client": ("testclient", 12345),
+        "server": ("testserver", 80),
+    }
+    task = asyncio.create_task(app(scope, receive, send))
+
+    def body():
+        return b"".join(
+            message.get("body", b"")
+            for message in messages
+            if message["type"] == "http.response.body"
+        )
+
+    async def wait_for_events(count):
+        async with asyncio.timeout(10):
+            async with changed:
+                await changed.wait_for(
+                    lambda: sum(
+                        line.startswith(b"id: ") for line in body().splitlines()
+                    ) >= count or task.done()
+                )
+        assert not task.done(), "SSE request ended before the expected events arrived"
+
+    async def wait_for_heartbeat():
+        async with asyncio.timeout(5):
+            async with changed:
+                await changed.wait_for(
+                    lambda: b": keep-alive\n\n" in body() or task.done()
+                )
+        assert not task.done(), "SSE request ended before the heartbeat arrived"
+
+    async def close():
+        disconnected.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    async def wait_for_response_start():
+        async with asyncio.timeout(5):
+            async with changed:
+                await changed.wait_for(
+                    lambda: any(
+                        message["type"] == "http.response.start" for message in messages
+                    ) or task.done()
+                )
+        assert not task.done(), "SSE request ended before response start"
+
+    return {
+        "messages": messages,
+        "body": body,
+        "wait_for_events": wait_for_events,
+        "wait_for_heartbeat": wait_for_heartbeat,
+        "wait_for_response_start": wait_for_response_start,
+        "close": close,
+        "task": task,
+    }
+
+
+async def _wait_for_sse_listener(db, *, different_from=None):
+    conn = await asyncpg.connect(db["superuser_dsn"])
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                listeners = await conn.fetch(
+                    "SELECT pid FROM pg_stat_activity "
+                    "WHERE application_name = 'agentforge-sse-listener' "
+                    "AND datname = current_database() ORDER BY backend_start DESC"
+                )
+                pids = [row["pid"] for row in listeners]
+                if pids and (different_from is None or different_from not in pids):
+                    return pids[0]
+                await asyncio.sleep(0.01)
+    finally:
+        await conn.close()
+
+
+async def _wait_for_sse_listener_closed(db, pid):
+    conn = await asyncpg.connect(db["superuser_dsn"])
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                active = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                    "WHERE application_name = 'agentforge-sse-listener' AND pid = $1)",
+                    pid,
+                )
+                if not active:
+                    return
+                await asyncio.sleep(0.01)
+    finally:
+        await conn.close()
+
+
+async def _run_asgi_stream(app, path, headers, *, event_count):
+    stream = await _open_asgi_stream(app, path, headers)
+    try:
+        await stream["wait_for_events"](event_count)
+        response_start = next(
+            message for message in stream["messages"]
+            if message["type"] == "http.response.start"
+        )
+        return response_start["status"], dict(response_start["headers"]), stream["body"]()
+    finally:
+        await stream["close"]()
+
+
+async def test_task_events_stream_limit_returns_retry_after(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-limiter",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+
+    class SaturatedLimiter:
+        def try_acquire(self, _principal_id):
+            return False
+
+        def release(self, _principal_id):
+            raise AssertionError("a rejected stream must not release a permit")
+
+    app.state.stream_limiter = SaturatedLimiter()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            f"/api/v1/tasks/{task_id}/events",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["error"]["code"] == "RATE_LIMITED"
+
+
+async def test_task_events_stream_requires_authentication(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as missing:
+        response = await missing.get(
+            "/api/v1/tasks/00000000-0000-0000-0000-000000000001/events"
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHENTICATED"
+
+
+async def test_task_events_stream_replays_persisted_history_in_order(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-history",
+            },
+        )
+    assert created.status_code == 202
+    task_id = created.json()["task_id"]
+
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.executemany(
+            """
+            INSERT INTO runtime.task_events
+                (task_id, task_event_seq, event_type, payload_json)
+            VALUES ($1::uuid, $2, $3, $4::jsonb)
+            """,
+            [
+                (task_id, 2, "task.progress", '{"step":"plan_metrics"}'),
+                (task_id, 3, "task.completed", '{"status":"completed"}'),
+            ],
+        )
+    finally:
+        await conn.close()
+
+    status, response_headers, body = await _run_asgi_stream(
+        _app(db),
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}"},
+        event_count=3,
+    )
+
+    assert status == 200
+    assert response_headers[b"content-type"].startswith(b"text/event-stream")
+    assert body.split(b"\n\n") == [
+        b'id: 1\nevent: task.created\ndata: {"status":"queued"}',
+        b'id: 2\nevent: task.progress\ndata: {"step":"plan_metrics"}',
+        b'id: 3\nevent: task.completed\ndata: {"status":"completed"}',
+        b"",
+    ]
+
+
+async def test_task_creation_notifies_only_committed_event(seeded_tasks_db):
+    db = seeded_tasks_db
+    received = asyncio.Queue()
+    listener = await asyncpg.connect(
+        db["role_dsn"]("api"),
+        server_settings={"application_name": "test-task-event-notifier"},
+    )
+    await listener.add_listener(
+        "agentforge_task_events",
+        lambda _conn, _pid, _channel, payload: received.put_nowait(json.loads(payload)),
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+        ) as client:
+            created = await client.post(
+                "/api/v1/tasks", json=_request_body(),
+                headers={
+                    "Authorization": f"Bearer {_token()}",
+                    "Idempotency-Key": "task-create-notification",
+                },
+            )
+        assert created.status_code == 202
+        notification = await asyncio.wait_for(received.get(), timeout=2)
+        task_id = created.json()["task_id"]
+        assert notification == {"seq": 1, "task_id": task_id}
+        conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+        try:
+            event = await conn.fetchrow(
+                "SELECT task_event_seq, event_type FROM runtime.task_events "
+                "WHERE task_id = $1::uuid AND task_event_seq = $2",
+                task_id,
+                notification["seq"],
+            )
+        finally:
+            await conn.close()
+        assert (event["task_event_seq"], event["event_type"]) == (1, "task.created")
+    finally:
+        await listener.close()
+
+
+async def test_task_events_stream_resumes_strictly_after_last_event_id(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-resume",
+            },
+        )
+    task_id = created.json()["task_id"]
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.executemany(
+            """
+            INSERT INTO runtime.task_events
+                (task_id, task_event_seq, event_type, payload_json)
+            VALUES ($1::uuid, $2, $3, $4::jsonb)
+            """,
+            [
+                (task_id, 2, "step.completed", '{"step_key":"plan_metrics"}'),
+                (task_id, 3, "task.completed", '{"status":"completed"}'),
+            ],
+        )
+    finally:
+        await conn.close()
+
+    status, _, body = await _run_asgi_stream(
+        _app(db),
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+        event_count=2,
+    )
+
+    assert status == 200
+    assert body.split(b"\n\n") == [
+        b'id: 2\nevent: step.completed\ndata: {"step_key":"plan_metrics"}',
+        b'id: 3\nevent: task.completed\ndata: {"status":"completed"}',
+        b"",
+    ]
+
+
+async def test_task_events_stream_delivers_notifications_only_after_commit(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-commit-order",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+    app.state.event_poll_seconds = 0.05
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+    )
+    await _wait_for_sse_listener(db)
+    await stream["wait_for_heartbeat"]()
+    received = asyncio.Queue()
+    notifier = await asyncpg.connect(db["role_dsn"]("api"))
+    await notifier.add_listener(
+        "agentforge_task_events",
+        lambda _conn, _pid, _channel, payload: received.put_nowait(json.loads(payload)),
+    )
+    transaction_conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    transaction = transaction_conn.transaction()
+    await transaction.start()
+    try:
+        await transaction_conn.execute(
+            "INSERT INTO runtime.task_events (task_id, task_event_seq, event_type, payload_json) "
+            "VALUES ($1::uuid, 2, 'step.started', '{\"step_key\":\"plan_metrics\"}'::jsonb)",
+            task_id,
+        )
+        await transaction_conn.execute(
+            "SELECT pg_notify('agentforge_task_events', $1)",
+            json.dumps({"task_id": task_id, "seq": 2}),
+        )
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(received.get(), timeout=0.1)
+        assert b"id: 2" not in stream["body"]()
+        await transaction.commit()
+        notification = await asyncio.wait_for(received.get(), timeout=2)
+        assert notification == {"seq": 2, "task_id": task_id}
+        await stream["wait_for_events"](1)
+        assert b'id: 2\nevent: step.started\ndata: {"step_key":"plan_metrics"}' in stream["body"]()
+    finally:
+        if transaction_conn.is_in_transaction():
+            await transaction.rollback()
+        await transaction_conn.close()
+        await notifier.close()
+        await stream["close"]()
+
+
+async def test_task_events_stream_heartbeat_does_not_advance_event_id(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-heartbeat",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+    app.state.event_poll_seconds = 0.05
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+    )
+    try:
+        await stream["wait_for_heartbeat"]()
+        assert stream["body"]() == b": keep-alive\n\n"
+    finally:
+        await stream["close"]()
+
+
+async def test_task_events_stream_recovers_when_notification_is_lost(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-lost-notify",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+    app.state.event_poll_seconds = 0.05
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+    )
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO runtime.task_events (task_id, task_event_seq, event_type, payload_json) "
+            "VALUES ($1::uuid, 2, 'step.completed', '{\"step_key\":\"plan_metrics\"}'::jsonb)",
+            task_id,
+        )
+        await stream["wait_for_events"](1)
+        assert b'id: 2\nevent: step.completed\ndata: {"step_key":"plan_metrics"}' in stream["body"]()
+    finally:
+        await conn.close()
+        await stream["close"]()
+
+
+async def test_task_events_stream_reconnects_after_listener_connection_closes(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-listener-reconnect",
+            },
+        )
+    task_id = created.json()["task_id"]
+    app = _app(db)
+    app.state.event_poll_seconds = 0.05
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+    )
+    first_pid = await _wait_for_sse_listener(db)
+    conn = await asyncpg.connect(db["superuser_dsn"])
+    try:
+        await conn.execute("SELECT pg_terminate_backend($1)", first_pid)
+    finally:
+        await conn.close()
+
+    try:
+        second_pid = await _wait_for_sse_listener(db, different_from=first_pid)
+        assert second_pid != first_pid
+        writer = await asyncpg.connect(db["role_dsn"]("migrator"))
+        try:
+            await writer.execute(
+                "INSERT INTO runtime.task_events (task_id, task_event_seq, event_type, payload_json) "
+                "VALUES ($1::uuid, 2, 'step.completed', '{\"step_key\":\"plan_metrics\"}'::jsonb)",
+                task_id,
+            )
+            await stream["wait_for_events"](1)
+            assert b'id: 2\nevent: step.completed\ndata: {"step_key":"plan_metrics"}' in stream["body"]()
+        finally:
+            await writer.close()
+    finally:
+        await stream["close"]()
+
+
+async def test_task_events_stream_closes_listener_on_disconnect(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-listener-cleanup",
+            },
+        )
+    task_id = created.json()["task_id"]
+    stream = await _open_asgi_stream(
+        _app(db),
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {_token()}", "Last-Event-ID": "1"},
+    )
+    listener_pid = await _wait_for_sse_listener(db)
+    await stream["close"]()
+    await _wait_for_sse_listener_closed(db, listener_pid)
+
+
+async def test_task_events_stream_hides_foreign_task_existence(seeded_tasks_db):
+    db = seeded_tasks_db
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        created = await client.post(
+            "/api/v1/tasks", json=_request_body(),
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Idempotency-Key": "task-events-owner",
+            },
+        )
+    task_id = created.json()["task_id"]
+    foreign_user_id = "0192a3b4-c5d6-7e8f-9012-3456789abcdf"
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO identity.users (id, email, display_name, status) "
+            "VALUES ($1::uuid, 'other-task-user@example.com', 'Other User', 'active')",
+            foreign_user_id,
+        )
+    finally:
+        await conn.close()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        foreign = await client.get(
+            f"/api/v1/tasks/{task_id}/events",
+            headers={"Authorization": f"Bearer {_token(foreign_user_id)}"},
+        )
+        missing = await client.get(
+            "/api/v1/tasks/00000000-0000-0000-0000-000000000001/events",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json()["error"]["code"] == missing.json()["error"]["code"] == "TASK_NOT_FOUND"
+
+
+@pytest.mark.parametrize("cursor", ["-1", "nope", "9223372036854775808"])
+async def test_task_events_stream_rejects_invalid_last_event_id(seeded_tasks_db, cursor):
+    db = seeded_tasks_db
+    task_id = str(uuid.uuid4())
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            """
+            INSERT INTO runtime.tasks
+                (id, trace_id, owner_user_id, agent_version_id, task_type, status,
+                 input_json, input_hash, region_scope_json, authorization_snapshot,
+                 data_snapshot_id)
+            SELECT $1::uuid, $1::text, $2::uuid, id, 'business_analysis', 'queued',
+                   '{}'::jsonb, repeat('a', 64), '[]'::jsonb, '[]'::jsonb,
+                   (SELECT data_snapshot_id FROM business.data_snapshots LIMIT 1)
+            FROM registry.agent_versions WHERE id = $3::uuid
+            """,
+            task_id, USER_ID, AGENT_VERSION_ID,
+        )
+    finally:
+        await conn.close()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(db)), base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            f"/api/v1/tasks/{task_id}/events",
+            headers={"Authorization": f"Bearer {_token()}", "Last-Event-ID": cursor},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"

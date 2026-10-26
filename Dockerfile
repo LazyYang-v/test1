@@ -11,6 +11,8 @@ COPY pyproject.toml uv.lock ./
 COPY apps/api/pyproject.toml apps/api/pyproject.toml
 COPY apps/worker/pyproject.toml apps/worker/pyproject.toml
 COPY packages/core/pyproject.toml packages/core/pyproject.toml
+COPY packages/core/src/agentforge_core/__init__.py packages/core/src/agentforge_core/__init__.py
+COPY packages/core/src/agentforge_core/observability.py packages/core/src/agentforge_core/observability.py
 COPY packages/harness/pyproject.toml packages/harness/pyproject.toml
 COPY packages/runtime/pyproject.toml packages/runtime/pyproject.toml
 RUN uv sync --frozen --no-dev --no-install-project --no-install-workspace

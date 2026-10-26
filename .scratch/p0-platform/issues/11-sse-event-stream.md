@@ -4,7 +4,7 @@
 
 **Blocked by:** 06
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 事件先持久化后通知；SSE id = task_event_seq，任务内严格递增
 - [ ] 支持 Last-Event-ID：断线重连从该序号补发全部后续事件（RT-13）
@@ -12,3 +12,7 @@
 - [ ] 通知协议时序正确：pg_notify 在事件事务内发出、提交后交付
 - [ ] 连接断开不影响任务执行；API 文档注明客户端按序号去重与 at-least-once 语义
 - [ ] 未授权用户订阅他人任务事件被拒
+
+## Comments
+
+- 2026-10-26: Claimed ticket 11 and started implementing the authenticated, owner-scoped SSE endpoint with persisted replay and PostgreSQL notification wakeups.
