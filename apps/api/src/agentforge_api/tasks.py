@@ -2,22 +2,46 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
+import re
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
+import jwt
 from fastapi import APIRouter, Depends, Header, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
 from agentforge_core.faults import FaultPoint
+from agentforge_core.observability import log_event, span
 
+logger = logging.getLogger("agentforge.api")
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+_SSE_BEARER = HTTPBearer(auto_error=False)
+_EVENT_CHANNEL = "agentforge_task_events"
+_EVENT_POLL_SECONDS = 10.0
+_MAX_EVENT_ID = 9_223_372_036_854_775_807
+_EVENT_DB_TIMEOUT_SECONDS = 1.0
+_EVENT_RETRY_SECONDS = 1.0
+_TRANSIENT_EVENT_DB_ERRORS = (
+    OSError,
+    asyncpg.InterfaceError,
+    asyncpg.PostgresConnectionError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.TooManyConnectionsError,
+    asyncpg.AdminShutdownError,
+    asyncpg.CrashShutdownError,
+    asyncpg.QueryCanceledError,
+    asyncio.TimeoutError,
+)
 
 TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
 CANCEL_REQUEST_EVENT = "task.cancel.requested"
@@ -36,6 +60,14 @@ def _hash(value: Any) -> str:
 
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
+
+
+async def _notify_task_event(conn: asyncpg.Connection, task_id: str, sequence: int) -> None:
+    await conn.execute(
+        "SELECT pg_notify($1, $2)",
+        _EVENT_CHANNEL,
+        _canonical({"task_id": task_id, "seq": sequence}),
+    )
 
 
 class DateRange(BaseModel):
@@ -330,10 +362,10 @@ async def create_task(
                 created_at = await conn.fetchval(
                     """
                     INSERT INTO runtime.tasks
-                        (id, owner_user_id, agent_version_id, task_type, status,
+                        (id, trace_id, owner_user_id, agent_version_id, task_type, status,
                          input_json, input_hash, region_scope_json, authorization_snapshot,
                          data_snapshot_id, max_attempts, deadline_at)
-                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
+                    VALUES ($1::uuid, $1::text, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
                             $7::jsonb, $8::jsonb, $9, $10,
                             now() + ($11 * interval '1 second'))
                     RETURNING created_at
@@ -364,8 +396,9 @@ async def create_task(
                 """,
                 task_id,
                 _canonical({"status": "queued"}),
-                request.state.request_id,
+                task_id,
             )
+            await _notify_task_event(conn, task_id, 1)
             await conn.execute(
                 """
                 INSERT INTO audit.audit_events
@@ -382,7 +415,7 @@ async def create_task(
                     "region_codes": body.input.region_codes,
                     "data_snapshot_id": snapshot["data_snapshot_id"].strip(),
                 }),
-                request.state.request_id,
+                task_id,
             )
             response = _task_response(
                 task_id, agent_version=agent["version"], created_at=created_at
@@ -406,6 +439,15 @@ async def create_task(
         FaultPoint.TASK_CREATE_AFTER_COMMIT,
         {"task_id": task_id, "idempotency_key": idempotency_key},
     )
+    with span("task.create", trace_id=task_id, task_id=task_id):
+        log_event(
+            logger,
+            logging.INFO,
+            "task.created",
+            request_id=request.state.request_id,
+            trace_id=task_id,
+            task_id=task_id,
+        )
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 
@@ -433,7 +475,7 @@ async def cancel_task(
             )
             row = await conn.fetchrow(
                 """
-                SELECT task.status, task.version,
+                SELECT task.status, task.version, task.trace_id,
                        (task.deadline_at IS NOT NULL
                         AND task.deadline_at <= now()) AS expired,
                        EXISTS (
@@ -513,8 +555,9 @@ async def cancel_task(
                     "requested_by": principal["id"],
                     "target_status": target_status,
                 }),
-                request.state.request_id,
+                row["trace_id"],
             )
+            await _notify_task_event(conn, task_id_str, seq)
             if target_status == "cancelled":
                 await conn.execute(
                     """
@@ -526,8 +569,9 @@ async def cancel_task(
                     task_id_str,
                     seq + 1,
                     _canonical({"reason": body.reason, "source": "api"}),
-                    request.state.request_id,
+                    row["trace_id"],
                 )
+                await _notify_task_event(conn, task_id_str, seq + 1)
             await conn.execute(
                 """
                 INSERT INTO audit.audit_events
@@ -543,7 +587,7 @@ async def cancel_task(
                     "expected_version": body.expected_version,
                     "target_status": target_status,
                 }),
-                request.state.request_id,
+                row["trace_id"],
             )
     return JSONResponse(
         status_code=202,
@@ -631,6 +675,225 @@ async def list_tasks(
         "offset": offset,
         "has_more": has_more,
     }
+
+
+def _event_cursor(value: str | None) -> int:
+    if value is None:
+        return 0
+    if not re.fullmatch(r"[0-9]{1,19}", value):
+        raise ApiError(400, "INVALID_REQUEST", "Last-Event-ID must be a nonnegative integer")
+    cursor = int(value)
+    if cursor > _MAX_EVENT_ID:
+        raise ApiError(400, "INVALID_REQUEST", "Last-Event-ID is too large")
+    return cursor
+
+
+def _sse_frame(row: asyncpg.Record) -> bytes:
+    payload = _json_value(row["payload_json"])
+    data = _canonical(payload)
+    event_type = str(row["event_type"]).replace("\r", "").replace("\n", "")
+    return (
+        f"id: {row['task_event_seq']}\nevent: {event_type}\ndata: {data}\n\n"
+    ).encode("utf-8")
+
+
+async def _task_event_stream(
+    request: Request,
+    task_id: str,
+    cursor: int,
+    *,
+    user_id: str,
+    token_version: int,
+    token_expiry: int,
+):
+    """Replay persisted events and use LISTEN only to wake up the DB reader."""
+    listener = None
+    wakeup = asyncio.Event()
+
+    def on_notification(_connection, _process_id, _channel, payload):
+        try:
+            notification = json.loads(payload)
+            if notification.get("task_id") == task_id:
+                wakeup.set()
+        except (TypeError, ValueError, AttributeError):
+            # Notifications are hints; malformed hints are ignored and polling
+            # continues to read the durable event history.
+            return
+
+    def on_listener_termination(_connection):
+        wakeup.set()
+
+    try:
+        while True:
+            if int(datetime.now(UTC).timestamp()) >= token_expiry:
+                break
+
+            if listener is None or listener.is_closed():
+                if listener is not None:
+                    await listener.close()
+                try:
+                    listener = await asyncpg.connect(
+                        request.app.state.settings.api_db_dsn,
+                        timeout=_EVENT_DB_TIMEOUT_SECONDS,
+                        server_settings={
+                            "application_name": "agentforge-sse-listener-starting",
+                            "statement_timeout": "1000",
+                        },
+                    )
+                    await listener.add_listener(_EVENT_CHANNEL, on_notification)
+                    await listener.execute("SET application_name = 'agentforge-sse-listener'")
+                    listener.add_termination_listener(on_listener_termination)
+                except _TRANSIENT_EVENT_DB_ERRORS:
+                    if listener is not None:
+                        await listener.close()
+                    listener = None
+
+            wakeup.clear()
+            try:
+                connect_events = getattr(
+                    request.app.state,
+                    "connect_events",
+                    request.app.state.connect,
+                )
+                async with connect_events() as conn:
+                    await conn.execute("SET statement_timeout = 900")
+                    rows = await conn.fetch(
+                        """
+                        SELECT event.task_event_seq, event.event_type, event.payload_json,
+                               task.owner_user_id = $2::uuid AS owns_task,
+                               user_row.status = 'active' AS user_active,
+                               user_row.token_version = $3 AS token_current,
+                               NOT EXISTS (
+                                   SELECT 1
+                                   FROM jsonb_array_elements_text(task.region_scope_json)
+                                        AS region(region_code)
+                                   WHERE NOT EXISTS (
+                                       SELECT 1 FROM identity.region_grants AS grant_row
+                                       WHERE grant_row.region_code = region.region_code
+                                         AND grant_row.user_id = task.owner_user_id
+                                         AND grant_row.revoked_at IS NULL
+                                         AND grant_row.permission IN ('read', 'admin')
+                                   )
+                               ) AS has_region_access
+                        FROM runtime.tasks AS task
+                        JOIN identity.users AS user_row ON user_row.id = $2::uuid
+                        LEFT JOIN runtime.task_events AS event
+                          ON event.task_id = task.id AND event.task_event_seq > $4
+                        WHERE task.id = $1::uuid
+                        ORDER BY event.task_event_seq
+                        LIMIT 100
+                        """,
+                        task_id,
+                        user_id,
+                        token_version,
+                        cursor,
+                    )
+            except _TRANSIENT_EVENT_DB_ERRORS:
+                # A temporary database failure must not end the client stream.
+                if listener is not None:
+                    await listener.close()
+                    listener = None
+                wakeup.clear()
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=1.0)
+                except TimeoutError:
+                    pass
+                yield b": keep-alive\n\n"
+                continue
+
+            if not rows or not all(
+                rows[0][field]
+                for field in ("owns_task", "user_active", "token_current", "has_region_access")
+            ):
+                break
+
+            event_rows = [row for row in rows if row["task_event_seq"] is not None]
+            if event_rows:
+                for row in event_rows:
+                    seq = row["task_event_seq"]
+                    if seq <= cursor:
+                        continue
+                    cursor = seq
+                    yield _sse_frame(row)
+                continue
+
+            poll_seconds = min(
+                _EVENT_POLL_SECONDS,
+                max(0.01, float(getattr(request.app.state, "event_poll_seconds", _EVENT_POLL_SECONDS))),
+            )
+            wait_seconds = min(poll_seconds, 1.0) if listener is None else poll_seconds
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=wait_seconds)
+            except TimeoutError:
+                pass
+            # Heartbeat comments carry no sequence and are safe to ignore.
+            yield b": keep-alive\n\n"
+    finally:
+        if listener is not None:
+            await listener.close()
+
+
+@router.get("/{task_id}/events")
+async def stream_task_events(
+    task_id: uuid.UUID,
+    request: Request,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_SSE_BEARER),
+    principal: dict[str, Any] = Depends(current_principal),
+):
+    async with request.app.state.connect() as conn:
+        owns_task = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM runtime.tasks WHERE id = $1::uuid AND owner_user_id = $2::uuid)",
+            str(task_id),
+            principal["id"],
+        )
+    if not owns_task:
+        raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
+    cursor = _event_cursor(last_event_id)
+    try:
+        claims = jwt.decode(
+            credentials.credentials if credentials is not None else "",
+            request.app.state.settings.jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "token_version"]},
+        )
+        token_version = int(claims["token_version"])
+        token_expiry = int(claims["exp"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise ApiError(401, "UNAUTHENTICATED", "Authentication required") from None
+
+    limiter = request.app.state.stream_limiter
+    if not limiter.try_acquire(principal["id"]):
+        raise ApiError(
+            429,
+            "RATE_LIMITED",
+            "Too many active event streams",
+            retryable=True,
+            headers={"Retry-After": "1"},
+        )
+
+    async def stream_body():
+        try:
+            async for frame in _task_event_stream(
+                request,
+                str(task_id),
+                cursor,
+                user_id=principal["id"],
+                token_version=token_version,
+                token_expiry=token_expiry,
+            ):
+                yield frame
+        finally:
+            limiter.release(principal["id"])
+
+    return StreamingResponse(
+        stream_body(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{task_id}")

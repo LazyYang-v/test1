@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from decimal import Decimal
 from typing import Any, TypedDict
@@ -21,6 +22,7 @@ from agentforge_core.faults import (
 )
 from agentforge_harness.models import (
     ModelOutputError,
+    ModelProviderConfigurationError,
     ModelRequest,
     ModelResponse,
     generate_json,
@@ -34,6 +36,9 @@ from agentforge_harness.report import (
 from agentforge_harness.schemas import COMPOSE_SCHEMA, PLAN_SCHEMA
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
+from agentforge_core.observability import log_event, span
+
+logger = logging.getLogger("agentforge.worker")
 from agentforge_runtime.store import RuntimeStore
 from agentforge_worker.config import WorkerSettings
 
@@ -75,6 +80,14 @@ class UnsupportedGraphError(RuntimeError):
     code = "GRAPH_UNSUPPORTED"
 
 
+class EvaluationBudgetError(RuntimeError):
+    code = "BUDGET_EXCEEDED"
+
+
+class LiveModelUnavailableError(RuntimeError):
+    code = "LIVE_MODEL_UNAVAILABLE"
+
+
 class RuntimeModelRecorder:
     """Persists each physical model call, including failed validation attempts."""
 
@@ -86,22 +99,98 @@ class RuntimeModelRecorder:
         agent_version_id: str,
         provider: str,
         model_name: str,
+        evaluation_run_id: str | None = None,
+        model_mode: str | None = None,
+        live_call_budget: int | None = None,
     ) -> None:
         self._pool = pool
         self._lease = lease
         self._agent_version_id = agent_version_id
         self._provider = provider
         self._model_name = model_name
+        self._evaluation_run_id = evaluation_run_id
+        self._model_mode = model_mode
+        self._live_call_budget = live_call_budget
+        self._started_at: dict[str, float] = {}
+        self._request_parameters: dict[str, dict[str, Any]] = {}
 
     async def record_started(self, invocation_key: str, request: ModelRequest) -> None:
+        self._started_at[invocation_key] = asyncio.get_running_loop().time()
+        self._request_parameters[invocation_key] = dict(request.provider_parameters)
+        with span(
+            "model.invocation",
+            trace_id=self._lease.trace_id,
+            task_id=self._lease.task_id,
+            attempt_id=self._lease.attempt_id,
+        ):
+            await self._record_started(invocation_key, request)
+
+    async def _record_started(
+        self, invocation_key: str, request: ModelRequest
+    ) -> None:
         async with self._pool.acquire() as conn:
+            if self._evaluation_run_id is not None and self._model_mode == "live":
+                async with conn.transaction():
+                    run = await conn.fetchrow(
+                        """
+                        UPDATE evaluation.runs
+                        SET live_calls_used = live_calls_used + 1, status = 'running'
+                        WHERE id = $1::uuid AND model_mode = 'live'
+                          AND live_call_budget = $2
+                          AND live_calls_used < $2
+                          AND EXISTS (
+                              SELECT 1
+                              FROM runtime.tasks AS task
+                              JOIN runtime.task_attempts AS attempt
+                                ON attempt.id = $4::uuid AND attempt.task_id = task.id
+                              WHERE task.id = $3::uuid AND task.status = 'running'
+                                AND task.cancel_requested_at IS NULL
+                                AND (task.deadline_at IS NULL OR task.deadline_at > now())
+                                AND attempt.lease_token = $5::uuid
+                                AND attempt.fencing_epoch = $6
+                                AND attempt.status = 'running'
+                                AND attempt.lease_expires_at > now()
+                          )
+                        RETURNING live_calls_used
+                        """,
+                        self._evaluation_run_id,
+                        self._live_call_budget,
+                        self._lease.task_id,
+                        self._lease.attempt_id,
+                        self._lease.lease_token,
+                        self._lease.fencing_epoch,
+                    )
+                    if run is None:
+                        raise EvaluationBudgetError(
+                            "Live evaluation call budget is exhausted or the Task lease is no longer active"
+                        )
+                    await conn.execute(
+                        """
+                        INSERT INTO harness.model_invocations
+                            (id, task_id, attempt_id, invocation_key, agent_version_id,
+                             provider, model_name, context_hash, status, started_at)
+                        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8,
+                                'executing', now())
+                        ON CONFLICT (task_id, invocation_key) DO NOTHING
+                        """,
+                        str(uuid.uuid4()),
+                        self._lease.task_id,
+                        self._lease.attempt_id,
+                        invocation_key,
+                        self._agent_version_id,
+                        self._provider,
+                        self._model_name,
+                        request.context_hash or _hash(request.messages),
+                    )
+                return
             await conn.execute(
                 """
                 INSERT INTO harness.model_invocations
                     (id, task_id, attempt_id, invocation_key, agent_version_id,
-                     provider, model_name, context_hash, status, started_at)
+                     provider, model_name, context_hash, status, started_at,
+                     provider_parameters, trace_id)
                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8,
-                        'executing', now())
+                        'executing', now(), $9::jsonb, $10)
                 ON CONFLICT (task_id, invocation_key) DO NOTHING
                 """,
                 str(uuid.uuid4()),
@@ -112,6 +201,8 @@ class RuntimeModelRecorder:
                 self._provider,
                 self._model_name,
                 request.context_hash or _hash(request.messages),
+                _canonical(request.provider_parameters),
+                self._lease.trace_id,
             )
 
     async def record_finished(
@@ -123,12 +214,36 @@ class RuntimeModelRecorder:
         error_code = None
         if error is not None:
             error_code = getattr(error, "code", type(error).__name__)
+        finished_at = asyncio.get_running_loop().time()
+        started_at = self._started_at.pop(invocation_key, finished_at)
+        elapsed_ms = max(0, round((finished_at - started_at) * 1000))
+        request_parameters = self._request_parameters.pop(invocation_key, {})
+        provider_request_id = (
+            response.provider_request_id
+            if response is not None and response.provider_request_id is not None
+            else getattr(error, "provider_request_id", None)
+        )
+        duration_ms = (
+            response.duration_ms
+            if response is not None and response.duration_ms > 0
+            else getattr(error, "duration_ms", 0) or elapsed_ms
+        )
+        response_parameters = (
+            response.provider_parameters
+            if response is not None and response.provider_parameters
+            else getattr(error, "provider_parameters", {})
+        )
+        if response_parameters:
+            request_parameters.update(response_parameters)
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE harness.model_invocations
                 SET status = $4, input_tokens = $5, output_tokens = $6,
-                    estimated_cost = $7, error_code = $8, finished_at = now()
+                    estimated_cost = $7, error_code = $8,
+                    provider_request_id = $9, duration_ms = $10,
+                    provider_parameters = $11::jsonb, trace_id = $12,
+                    finished_at = now()
                 WHERE task_id = $1::uuid AND invocation_key = $2
                   AND attempt_id = $3::uuid
                 """,
@@ -140,6 +255,10 @@ class RuntimeModelRecorder:
                 0 if response is None else response.output_tokens,
                 Decimal("0") if response is None else response.estimated_cost,
                 error_code,
+                provider_request_id,
+                duration_ms,
+                _canonical(request_parameters),
+                self._lease.trace_id,
             )
 
 
@@ -158,9 +277,13 @@ class AnalysisGraph:
         settings: WorkerSettings,
         *,
         fault_injector: FaultInjector | None = None,
+        fake_model=None,
+        live_model=None,
     ) -> None:
         self._store = store
         self._model = model
+        self._fake_model = fake_model
+        self._live_model = live_model
         self._gateway = gateway
         self._settings = settings
         self._fault_injector = fault_injector or NOOP_FAULT_INJECTOR
@@ -168,16 +291,51 @@ class AnalysisGraph:
     async def run(self, lease: AttemptLease) -> dict[str, Any]:
         task = await self._store.load_task(lease.task_id)
         agent = await self._store.load_agent(task["agent_version_id"])
+        model = self._model
+        evaluation_run_id = task.get("evaluation_run_id")
+        live_call_budget = None
+        model_mode = None
+        if evaluation_run_id is not None:
+            async with self._store.pool.acquire() as conn:
+                evaluation = await conn.fetchrow(
+                    "SELECT model_mode, live_call_budget FROM evaluation.runs "
+                    "WHERE id = $1::uuid",
+                    evaluation_run_id,
+                )
+            if evaluation is None:
+                raise UnsupportedGraphError("evaluation run is missing")
+            model_mode = evaluation["model_mode"]
+            if model_mode == "fake":
+                if self._fake_model is None:
+                    raise UnsupportedGraphError("Fake Model is unavailable")
+                model = self._fake_model
+            elif model_mode == "live":
+                if self._live_model is None:
+                    raise LiveModelUnavailableError(
+                        "Live evaluation is enabled but no live model adapter is configured"
+                    )
+                model = self._live_model
+                live_call_budget = evaluation["live_call_budget"]
+            else:
+                raise UnsupportedGraphError("evaluation model mode is invalid")
         if agent["graph_key"] != "metrics-v1":
             raise UnsupportedGraphError(
                 f"unsupported graph_key {agent['graph_key']!r}"
             )
+        adapter = (
+            model.resolve(agent)
+            if callable(getattr(model, "resolve", None))
+            else model
+        )
         recorder = RuntimeModelRecorder(
             pool=self._store.pool,
             lease=lease,
             agent_version_id=task["agent_version_id"],
-            provider=agent["provider"],
-            model_name=agent["model_name"],
+            provider=getattr(model, "provider", agent["provider"]),
+            model_name=getattr(model, "model_name", agent["model_name"]),
+            evaluation_run_id=evaluation_run_id,
+            model_mode=model_mode,
+            live_call_budget=live_call_budget,
         )
         model_timeout_seconds = self._model_timeout_seconds(agent)
         max_output_tokens = agent.get("max_output_tokens")
@@ -190,6 +348,7 @@ class AnalysisGraph:
                     messages=self._plan_messages(task),
                     schema=PLAN_SCHEMA,
                     timeout_seconds=model_timeout_seconds,
+                    provider_parameters=self._provider_parameters(agent),
                     max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "plan_metrics:0",
@@ -204,7 +363,7 @@ class AnalysisGraph:
                     }),
                 )
                 content, _ = await generate_json(
-                    self._model,
+                    adapter,
                     request,
                     PLAN_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
@@ -237,12 +396,19 @@ class AnalysisGraph:
                     region_scope=tuple(task["region_scope_json"]),
                     lease_token=lease.lease_token,
                     fencing_epoch=lease.fencing_epoch,
+                    trace_id=task["trace_id"],
                     step_key="execute_metrics:0",
                     task_snapshot_id=task["data_snapshot_id"],
                 )
-                accepted = await self._gateway.invoke(
-                    context, "metrics.query", plan
-                )
+                with span(
+                    "tool.invocation",
+                    trace_id=context.trace_id,
+                    task_id=context.task_id,
+                    attempt_id=context.attempt_id,
+                ):
+                    accepted = await self._gateway.invoke(
+                        context, "metrics.query", plan
+                    )
                 return {
                     "tool_result": accepted["result"],
                     "evidence_id": accepted["evidence_id"],
@@ -272,6 +438,7 @@ class AnalysisGraph:
                     messages=self._compose_messages(task, summaries),
                     schema=COMPOSE_SCHEMA,
                     timeout_seconds=model_timeout_seconds,
+                    provider_parameters=self._provider_parameters(agent),
                     max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "compose_analysis:0",
@@ -288,7 +455,7 @@ class AnalysisGraph:
                     }),
                 )
                 content, _ = await generate_json(
-                    self._model,
+                    adapter,
                     request,
                     COMPOSE_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
@@ -425,6 +592,18 @@ class AnalysisGraph:
         )
         return result
 
+    @staticmethod
+    def _provider_parameters(agent: dict[str, Any]) -> dict[str, Any]:
+        snapshot = agent.get("model_config_snapshot")
+        if not isinstance(snapshot, dict):
+            return {}
+        parameters = snapshot.get("config_json", {})
+        if not isinstance(parameters, dict):
+            raise ModelProviderConfigurationError(
+                "frozen model parameters must be an object"
+            )
+        return dict(parameters)
+
     def _model_timeout_seconds(self, agent: dict[str, Any]) -> float:
         snapshot_timeout = agent.get("timeout_ms")
         if (
@@ -457,7 +636,8 @@ class AnalysisGraph:
                     + _canonical(PLAN_SCHEMA)
                     + ". The task input is: "
                     + _canonical(task["input_json"])
-                    + ". Never write SQL."
+                    + '. Example json: {"metric":"gmv","metric_version":1}. '
+                    "Never write SQL."
                 ),
             },
             {"role": "user", "content": task["input_json"]["question"]},
@@ -474,8 +654,8 @@ class AnalysisGraph:
                     "You compose an analysis from platform-verified metrics. Return "
                     "only json matching this schema: "
                     + _canonical(COMPOSE_SCHEMA)
-                    + ". Every finding must cite at least one of these evidence "
-                    "ids: "
+                    + '. Example json: {"summary":"GMV changed","findings":[]}. '
+                    "Every finding must cite at least one of these evidence ids: "
                     + _canonical([item["evidence_id"] for item in evidence_summaries])
                     + ". Mark every hypothesis as unverified. Never invent numbers."
                 ),
@@ -508,7 +688,55 @@ class AnalysisGraph:
             ),
             "data_snapshot_id": evidence["data_snapshot_id"],
             "annotations": list(query_plan.get("annotations") or []),
+            "dimension_results": AnalysisGraph._dimension_result_summary(
+                query_plan.get("dimension_results"),
+                query_plan.get("dimensions"),
+            ),
         }
+
+    @staticmethod
+    def _dimension_result_summary(
+        value: Any, allowed_dimensions: Any
+    ) -> list[dict[str, Any]]:
+        """Pass bounded, normalized breakdowns to compose without raw query data."""
+        if not isinstance(value, list):
+            return []
+        registered = frozenset(
+            dimension
+            for dimension in (allowed_dimensions or [])
+            if isinstance(dimension, str)
+        )
+        summary: list[dict[str, Any]] = []
+        for result in value[:100]:
+            if not isinstance(result, dict):
+                continue
+            raw_dimensions = result.get("dimensions")
+            if not isinstance(raw_dimensions, dict):
+                continue
+            dimensions = {
+                key: dimension_value[:128]
+                for key, dimension_value in raw_dimensions.items()
+                if key in registered
+                and isinstance(dimension_value, str)
+                and len(dimension_value) <= 128
+            }
+            row: dict[str, Any] = {"dimensions": dimensions}
+            for key in (
+                "current_value", "previous_value", "absolute_change", "change_rate"
+            ):
+                metric_value = result.get(key)
+                if metric_value is None or isinstance(metric_value, str):
+                    row[key] = metric_value
+            row_count = result.get("row_count")
+            if isinstance(row_count, int) and not isinstance(row_count, bool):
+                row["row_count"] = row_count
+            annotations = result.get("annotations")
+            if isinstance(annotations, list):
+                row["annotations"] = [
+                    item[:64] for item in annotations[:8] if isinstance(item, str)
+                ]
+            summary.append(row)
+        return summary
 
     @staticmethod
     def _to_evidence(evidence: dict[str, Any]) -> Evidence:

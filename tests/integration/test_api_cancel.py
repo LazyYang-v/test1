@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import asyncpg
 import pytest
@@ -28,6 +29,7 @@ from worker_support import (
     token,
     USER_ID,
 )
+from test_api_tasks import _open_asgi_stream, _wait_for_sse_listener
 
 pytestmark = pytest.mark.integration
 
@@ -67,6 +69,38 @@ async def _prepared_task(db: dict, **kwargs) -> str:
     await seed_agent(db)
     await complete_dataset_load(db)
     return await create_task_via_api(db, **kwargs)
+
+
+async def test_queued_cancel_events_wake_live_sse_subscriber(migrated_db):
+    db = migrated_db
+    task_id = await _prepared_task(db)
+    app = app_for(db)
+    app.state.event_poll_seconds = 10
+    stream = await _open_asgi_stream(
+        app,
+        f"/api/v1/tasks/{task_id}/events",
+        {"Authorization": f"Bearer {token()}", "Last-Event-ID": "1"},
+    )
+    await _wait_for_sse_listener(db)
+    try:
+        response = await post_cancel_via_api(db, task_id, 1)
+        assert response.status_code == 202
+        await asyncio.wait_for(stream["wait_for_events"](2), timeout=2)
+        event_frames = b"".join(
+            frame + b"\n\n"
+            for frame in stream["body"]().split(b"\n\n")
+            if frame and not frame.startswith(b":")
+        )
+        assert event_frames == (
+            b'id: 2\nevent: task.cancel.requested\ndata: '
+            b'{"expected_version":1,"reason":"operator requested cancellation",'
+            b'"requested_by":"0192a3b4-c5d6-7e8f-9012-3456789abcde",'
+            b'"target_status":"cancelled"}\n\n'
+            b'id: 3\nevent: task.cancelled\ndata: '
+            b'{"reason":"operator requested cancellation","source":"api"}\n\n'
+        )
+    finally:
+        await stream["close"]()
 
 
 async def test_queued_cancel_is_terminal_with_one_contiguous_event_stream(migrated_db):

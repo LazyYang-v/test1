@@ -4,7 +4,7 @@
 
 **Blocked by:** 07
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] datasets/cases/runs/case_results 落库；dataset 显式绑定 data_snapshot_id
 - [ ] `POST /evaluations/runs` 发起评测；评测任务 owner 为 svc-eval，不出现在普通用户任务列表

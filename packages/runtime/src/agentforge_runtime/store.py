@@ -15,6 +15,8 @@ from typing import Any
 
 import asyncpg
 
+from agentforge_core.evaluation import evaluate_case
+
 from agentforge_runtime.contracts import AttemptLease, StepRecord
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_core.faults import (
@@ -53,6 +55,7 @@ def _row_to_lease(row: asyncpg.Record) -> AttemptLease:
         lease_token=str(row["lease_token"]),
         fencing_epoch=row["fencing_epoch"],
         lease_expires_at=row["lease_expires_at"],
+        trace_id=row.get("trace_id"),
     )
 
 
@@ -136,7 +139,7 @@ class RuntimeStore:
                       )
                       AND (task.deadline_at IS NULL OR task.deadline_at > now())
                       AND task.current_attempt_no < task.max_attempts
-                    RETURNING task.id, task.current_attempt_no
+                    RETURNING task.id, task.current_attempt_no, task.trace_id
                     """,
                     candidate["id"],
                     CANCEL_REQUEST_EVENT,
@@ -144,6 +147,7 @@ class RuntimeStore:
                 if task is None:
                     return None
                 attempt_no = task["current_attempt_no"]
+                task_trace_id = task["trace_id"]
                 row = await conn.fetchrow(
                     """
                     INSERT INTO runtime.task_attempts
@@ -164,6 +168,8 @@ class RuntimeStore:
                     lease_token,
                     self.lease_seconds,
                 )
+                row = dict(row)
+                row["trace_id"] = task_trace_id
                 await self._append_event(
                     conn,
                     task_id=str(task["id"]),
@@ -316,8 +322,9 @@ class RuntimeStore:
                 SELECT id::text AS task_id, owner_user_id::text AS owner_user_id,
                        agent_version_id::text AS agent_version_id, task_type,
                        status, input_json, input_hash, region_scope_json,
-                       authorization_snapshot, data_snapshot_id, priority,
-                       current_attempt_no, max_attempts, deadline_at, created_at
+                       authorization_snapshot, data_snapshot_id, trace_id, priority,
+                       current_attempt_no, max_attempts, deadline_at, created_at,
+                       eval_run_id AS evaluation_run_id
                 FROM runtime.tasks WHERE id = $1::uuid
                 """,
                 task_id,
@@ -328,6 +335,8 @@ class RuntimeStore:
         for field in ("input_json", "region_scope_json", "authorization_snapshot"):
             result[field] = _json_value(result[field])
         result["data_snapshot_id"] = result["data_snapshot_id"].strip()
+        if result.get("evaluation_run_id") is not None:
+            result["evaluation_run_id"] = str(result["evaluation_run_id"])
         return result
 
     async def load_agent(self, agent_version_id: str) -> dict[str, Any]:
@@ -722,6 +731,7 @@ class RuntimeStore:
                     """,
                     lease.attempt_id,
                 )
+                await self._complete_evaluation_case(conn, lease.task_id, result)
                 await self._append_event(
                     conn,
                     task_id=lease.task_id,
@@ -762,6 +772,9 @@ class RuntimeStore:
                     lease.attempt_id,
                     error_code,
                     error_detail[:2000],
+                )
+                await self._complete_evaluation_case(
+                    conn, lease.task_id, None, task_error_code=error_code
                 )
                 await self._append_event(
                     conn,
@@ -1547,6 +1560,116 @@ class RuntimeStore:
 
     # -- internals -------------------------------------------------------
 
+    async def _complete_evaluation_case(
+        self,
+        conn: asyncpg.Connection,
+        task_id: str,
+        task_result: dict[str, Any] | None,
+        *,
+        task_error_code: str | None = None,
+    ) -> None:
+        task = await conn.fetchrow(
+            """
+            SELECT task.eval_run_id::text AS evaluation_run_id,
+                   task.status, task.result_json, task.error_code,
+                   task.data_snapshot_id
+            FROM runtime.tasks AS task WHERE task.id = $1::uuid
+            """,
+            task_id,
+        )
+        if task is None or task["evaluation_run_id"] is None:
+            return
+
+        case = await conn.fetchrow(
+            """
+            SELECT result.id::text AS result_id, result.eval_run_id::text AS run_id,
+                   result.created_at AS started_at, case_row.case_key, case_row.input_json,
+                   case_row.expected_json, case_row.assertions_json,
+                   case_row.data_snapshot_ref
+            FROM evaluation.case_results AS result
+            JOIN evaluation.cases AS case_row ON case_row.id = result.case_id
+            WHERE result.task_id = $1::uuid AND result.status = 'pending'
+            FOR UPDATE OF result
+            """,
+            task_id,
+        )
+        if case is None:
+            return
+        evidence_rows = await conn.fetch(
+            """
+            SELECT id::text AS evidence_id, task_id::text AS task_id,
+                   data_snapshot_id, query_plan_json
+            FROM harness.evidences WHERE task_id = $1::uuid
+            ORDER BY created_at, id
+            """,
+            task_id,
+        )
+        case_data = {
+            "case_key": case["case_key"],
+            "expected": _json_value(case["expected_json"]),
+            "assertions": _json_value(case["assertions_json"]),
+            "data_snapshot_ref": case["data_snapshot_ref"].strip(),
+            "input": _json_value(case["input_json"]),
+        }
+        result = evaluate_case(
+            case_data,
+            task_id=task_id,
+            task_status=task["status"],
+            task_result=task_result if task_error_code is None else None,
+            task_error_code=task_error_code,
+            task_snapshot_id=task["data_snapshot_id"].strip(),
+            evidences=[
+                {
+                    **dict(evidence),
+                    "data_snapshot_id": evidence["data_snapshot_id"].strip(),
+                    "query_plan_json": _json_value(evidence["query_plan_json"]),
+                }
+                for evidence in evidence_rows
+            ],
+        )
+        await conn.execute(
+            """
+            UPDATE evaluation.case_results
+            SET status = $2, score_json = $3::jsonb, failure_codes = $4::text[],
+                duration_ms = GREATEST(0, floor(extract(epoch FROM (now() - $5)) * 1000)::integer)
+            WHERE id = $1::uuid AND status = 'pending'
+            """,
+            case["result_id"],
+            result["status"],
+            _canonical(result["score_json"]),
+            result["failure_codes"],
+            case["started_at"],
+        )
+        pending = await conn.fetchval(
+            "SELECT count(*) FROM evaluation.case_results "
+            "WHERE eval_run_id = $1::uuid AND status = 'pending'",
+            case["run_id"],
+        )
+        if pending == 0:
+            summary = await conn.fetchrow(
+                """
+                SELECT count(*)::integer AS total,
+                       count(*) FILTER (WHERE status = 'passed')::integer AS passed,
+                       count(*) FILTER (WHERE status = 'failed')::integer AS failed
+                FROM evaluation.case_results WHERE eval_run_id = $1::uuid
+                """,
+                case["run_id"],
+            )
+            passed = summary["passed"]
+            total = summary["total"]
+            await conn.execute(
+                """
+                UPDATE evaluation.runs
+                SET status = CASE WHEN $1 = $2 THEN 'completed' ELSE 'failed' END,
+                    finished_at = now(),
+                    summary_json = jsonb_build_object(
+                        'total', $1, 'passed', $2, 'failed', $3, 'pending', 0,
+                        'score', to_char($2::numeric / NULLIF($1, 0), '0.0000'))
+                WHERE id = $4::uuid AND status <> 'completed'
+                """,
+                total, passed, summary["failed"], case["run_id"],
+            )
+
     async def _require_running_task(
         self, conn: asyncpg.Connection, lease: AttemptLease
     ) -> None:
@@ -1675,6 +1798,10 @@ class RuntimeStore:
         payload: dict[str, Any],
     ) -> int:
         await self._lock_events(conn, task_id)
+        trace_id = await conn.fetchval(
+            "SELECT trace_id FROM runtime.tasks WHERE id = $1::uuid",
+            task_id,
+        )
         seq = await conn.fetchval(
             "SELECT COALESCE(MAX(task_event_seq), 0) + 1 FROM runtime.task_events "
             "WHERE task_id = $1::uuid",
@@ -1683,13 +1810,19 @@ class RuntimeStore:
         await conn.execute(
             """
             INSERT INTO runtime.task_events
-                (task_id, attempt_id, task_event_seq, event_type, payload_json)
-            VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb)
+                (task_id, attempt_id, task_event_seq, event_type, payload_json, trace_id)
+            VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6)
             """,
             task_id,
             attempt_id,
             seq,
             event_type,
             _canonical(payload),
+            trace_id,
+        )
+        await conn.execute(
+            "SELECT pg_notify($1, $2)",
+            "agentforge_task_events",
+            _canonical({"task_id": task_id, "seq": seq}),
         )
         return seq

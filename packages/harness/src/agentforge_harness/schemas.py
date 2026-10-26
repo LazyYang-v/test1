@@ -17,14 +17,25 @@ PLAN_SCHEMA: dict[str, Any] = {
         "limit",
     ],
     "properties": {
-        "metric": {"type": "string", "enum": ["gmv"]},
+        "metric": {"type": "string", "minLength": 1},
         "metric_version": {"type": "integer", "minimum": 1},
         "dimensions": {
             "type": "array",
             "items": {"type": "string"},
             "maxItems": 4,
         },
-        "filters": {"type": "object"},
+        "filters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["region_code"],
+            "properties": {
+                "region_code": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string", "minLength": 1},
+                }
+            },
+        },
         "time_range": {
             "type": "object",
             "additionalProperties": False,

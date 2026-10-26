@@ -311,7 +311,10 @@ class ToolGateway:
                 request, descriptor.input_schema, error_code="TOOL_INPUT_INVALID"
             )
         except ToolInputError as error:
-            await reject(error.code, str(error), descriptor)
+            # A metrics plan rejected by the immutable v1 JSON Schema still
+            # represents an invalid Metric Query Plan at the public tool seam.
+            code = "QUERY_PLAN_INVALID" if tool_key == "metrics.query" else error.code
+            await reject(code, str(error), descriptor)
 
         # 3. Live user region authorization, never the stale snapshot.
         requested_regions = list(
@@ -355,8 +358,9 @@ class ToolGateway:
         previous = await self._backend.find_invocation(context.task_id, invocation_key)
         allowed_metrics = policy.get("allowed_metrics")
         if allowed_metrics is not None and request.get("metric") not in allowed_metrics:
+            code = "QUERY_PLAN_INVALID" if tool_key == "metrics.query" else "TOOL_INPUT_INVALID"
             await reject(
-                "TOOL_INPUT_INVALID",
+                code,
                 "metric is outside the tightened policy",
                 descriptor,
             )

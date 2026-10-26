@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import random
 from typing import Any
 
@@ -18,6 +19,7 @@ from agentforge_core.faults import FaultInjector, InjectedCrash, NOOP_FAULT_INJE
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_runtime.store import RuntimeStore
+from agentforge_core.observability import log_event
 
 from agentforge_worker.config import WorkerSettings
 from agentforge_worker.errors import classify_error_code, is_retryable
@@ -79,7 +81,13 @@ class Worker:
         except InjectedCrash:
             raise
         except Exception:  # pragma: no cover - defensive loop guard
-            logger.exception("reconciliation sweep failed")
+            log_event(
+                logger,
+                logging.ERROR,
+                "reconciliation.failed",
+                worker_id=self.settings.worker_id,
+                error_code="RECONCILIATION_FAILED",
+            )
             return {}
 
     async def run_once(self) -> bool:
@@ -93,7 +101,12 @@ class Worker:
         return True
 
     async def run_forever(self) -> None:
-        logger.info("worker started", extra={"worker_id": self.settings.worker_id})
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.started",
+            worker_id=self.settings.worker_id,
+        )
         while True:
             claimed = await self.run_once()
             if not claimed:
@@ -111,13 +124,18 @@ class Worker:
                 try:
                     alive = await self.store.heartbeat(lease)
                 except Exception:
-                    # A transient DB error says nothing about ownership. Stop
-                    # doing work, but leave the live Attempt row for expiry and
-                    # scanner recovery to decide.
-                    logger.exception(
-                        "heartbeat failed",
-                        extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "heartbeat.failed",
+                        trace_id=lease.trace_id,
+                        task_id=lease.task_id,
+                        attempt_id=lease.attempt_id,
+                        error_code="HEARTBEAT_UNCERTAIN",
                     )
+                    # A transient DB error says nothing about ownership. Stop
+                    # graph work, but leave the Attempt row for expiry and
+                    # scanner recovery to decide.
                     heartbeat_failed.set()
                     return
                 if not alive:
@@ -136,9 +154,14 @@ class Worker:
                 try:
                     reason = await self.store.stop_reason(lease)
                 except Exception:
-                    logger.exception(
-                        "cancellation watch failed",
-                        extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "cancellation.watch_failed",
+                        trace_id=lease.trace_id,
+                        task_id=lease.task_id,
+                        attempt_id=lease.attempt_id,
+                        error_code="CANCELLATION_WATCH_FAILED",
                     )
                     reason = None
                 if reason == "CANCELLED":
@@ -182,22 +205,28 @@ class Worker:
 
             if heartbeat_failed.is_set():
                 await self._stop_graph(graph_task)
-                logger.warning(
-                    "heartbeat unavailable; retaining attempt for lease expiry",
-                    extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "heartbeat.uncertain_attempt_retained",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code="HEARTBEAT_UNCERTAIN",
                 )
                 return
 
             if lease_lost.is_set():
                 await self._stop_graph(graph_task)
                 await self.store.abandon_attempt(lease)
-                logger.warning(
-                    "lease lost during execution",
-                    extra={
-                        "task_id": lease.task_id,
-                        "attempt_id": lease.attempt_id,
-                        "fencing_epoch": lease.fencing_epoch,
-                    },
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "lease.lost",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code="LEASE_LOST",
                 )
                 return
 
@@ -232,7 +261,17 @@ class Worker:
             except LeaseLostError:
                 await self.store.abandon_attempt(lease)
             except TaskNotRunningError as error:
-                # Cancellation or deadline won the terminal race.
+                # Preserve the Runtime cancellation/deadline transition and log
+                # the terminal race with the Task's stable trace identifier.
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "task.completion_skipped",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code=error.code,
+                )
                 await self._handle_refusal(lease, error)
         finally:
             stop.set()
@@ -292,23 +331,35 @@ class Worker:
         else:
             await self.store.abandon_attempt(lease, error_code=error.code)
 
-    def _retry_delay(self) -> float:
-        return self.settings.retry_base_delay_seconds + random.uniform(
+    def _retry_delay(self, error: BaseException | None = None) -> float:
+        delay = self.settings.retry_base_delay_seconds + random.uniform(
             0, self.settings.retry_jitter_seconds
         )
+        if error is None:
+            return delay
+        retry_after = getattr(error, "retry_after_seconds", None)
+        if (
+            isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            and math.isfinite(float(retry_after))
+            and retry_after >= 0
+        ):
+            return max(delay, float(retry_after))
+        return delay
 
     async def _handle_failure(
         self, lease: AttemptLease, error: BaseException
     ) -> None:
         code = classify_error_code(error)
-        logger.info(
-            "attempt failed",
-            extra={
-                "task_id": lease.task_id,
-                "attempt_id": lease.attempt_id,
-                "error_code": code,
-                "retryable": is_retryable(code),
-            },
+        log_event(
+            logger,
+            logging.ERROR,
+            "attempt.failed",
+            trace_id=lease.trace_id,
+            task_id=lease.task_id,
+            attempt_id=lease.attempt_id,
+            error_code=code,
+            retryable=is_retryable(code),
         )
         if isinstance(error, LeaseLostError):
             await self.store.abandon_attempt(lease, error_code=code)
@@ -318,20 +369,20 @@ class Worker:
             return
         try:
             if is_retryable(code):
-                outcome = await self.store.retry_task(
+                await self.store.retry_task(
                     lease,
                     code,
                     str(error),
-                    delay_seconds=self._retry_delay(),
+                    delay_seconds=self._retry_delay(error),
                 )
-                logger.info(
-                    "retryable failure handled",
-                    extra={
-                        "task_id": lease.task_id,
-                        "attempt_id": lease.attempt_id,
-                        "error_code": code,
-                        "outcome": outcome,
-                    },
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "attempt.retry_handled",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code=code,
                 )
             else:
                 await self.store.fail_task(lease, code, str(error))
