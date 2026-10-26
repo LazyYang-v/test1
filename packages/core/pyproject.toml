@@ -13,6 +13,8 @@ dependencies = [
 [project.scripts]
 agentforge-migrate = "agentforge_core.migrations:main"
 agentforge-registry = "agentforge_core.registry:main"
+agentforge-dataset = "agentforge_core.business_dataset:main"
+agentforge-seed = "agentforge_core.business_loader:main"
 
 [build-system]
 requires = ["hatchling"]
