@@ -4,9 +4,9 @@
 
 **Blocked by:** 02、03、04
 
-**Status:** claimed
+**Status:** resolved
 
-Integration: latest integration/p0 (`2b41af6`) is merged into this branch (`0b94c78`); pending final integration merge and full-suite verification by the coordinator. Keep Status claimed until those steps pass.
+Integration: ticket branch `ticket/05-task-creation-idempotency` (`7a75aa4a2bebaccc68aa6d7ce3dbc8790472d9b5`) was merged into `integration/p0` by merge commit `09d646751b16be9ecf5670d0a75832b0b7becc0c`.
 
 - [x] 合法请求 202 + task_id + links；Task 状态 queued，task.created 事件落库
 - [x] agent_key 解析不到已发布版本 → 拒绝；region_codes 非当前授权子集 → 403 REGION_ACCESS_DENIED；日期范围超 90 天 → 拒绝
@@ -27,4 +27,9 @@ Verification after merging integration/p0 `2b41af6890e9b3c85ec267a82f8dbb74357ae
 - `uv run pytest -q --tb=short` → `83 passed in 211.49s (0:03:31)`; includes `test_registry_migration_is_present_in_schema_version_six`.
 - `git diff --check integration/p0...HEAD` → clean.
 
-Migrations 0001–0005 are unchanged. Ticket implementation is ready for coordinator merge; keep the ticket claimed until final integration merge and full-suite verification pass. The separate Registry policy follow-up is tracked by ticket 04.
+Post-merge verification on `integration/p0` at `09d646751b16be9ecf5670d0a75832b0b7becc0c`:
+
+- `uv run pytest -q --tb=short` → `83 passed in 206.97s (0:03:26)`.
+- `git diff --check HEAD^1...HEAD` → clean.
+
+Migrations 0001–0005 are unchanged. Ticket 05 is resolved after the integration merge and full-suite pass. The separate Registry policy follow-up remains tracked by ticket 04.
