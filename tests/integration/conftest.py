@@ -31,6 +31,7 @@ POSTGRES_IMAGE = "postgres:17"
 SUPERUSER_PASSWORD = "agentforge-it-superuser"
 TEST_DB_PASSWORDS = {
     "AGENTFORGE_MIGRATOR_DB_PASSWORD": "it-migrator-pw",
+    "AGENTFORGE_REGISTRY_DB_PASSWORD": "it-registry-pw",
     "AGENTFORGE_API_DB_PASSWORD": "it-api-pw",
     "AGENTFORGE_WORKER_DB_PASSWORD": "it-worker-pw",
     "AGENTFORGE_BUSINESS_RO_DB_PASSWORD": "it-business-ro-pw",
@@ -38,6 +39,7 @@ TEST_DB_PASSWORDS = {
 }
 ROLE_USERS = {
     "migrator": "agentforge_migrator",
+    "registry_cli": "agentforge_registry_cli",
     "api": "agentforge_api",
     "worker": "agentforge_worker",
     "business_ro": "agentforge_business_ro",
@@ -45,6 +47,7 @@ ROLE_USERS = {
 }
 ROLE_PASSWORDS = {
     "migrator": TEST_DB_PASSWORDS["AGENTFORGE_MIGRATOR_DB_PASSWORD"],
+    "registry_cli": TEST_DB_PASSWORDS["AGENTFORGE_REGISTRY_DB_PASSWORD"],
     "api": TEST_DB_PASSWORDS["AGENTFORGE_API_DB_PASSWORD"],
     "worker": TEST_DB_PASSWORDS["AGENTFORGE_WORKER_DB_PASSWORD"],
     "business_ro": TEST_DB_PASSWORDS["AGENTFORGE_BUSINESS_RO_DB_PASSWORD"],
@@ -114,6 +117,8 @@ def postgres_server():
             "POSTGRES_DB=agentforge",
             "-e",
             f"AGENTFORGE_MIGRATOR_DB_PASSWORD={TEST_DB_PASSWORDS['AGENTFORGE_MIGRATOR_DB_PASSWORD']}",
+            "-e",
+            f"AGENTFORGE_REGISTRY_DB_PASSWORD={TEST_DB_PASSWORDS['AGENTFORGE_REGISTRY_DB_PASSWORD']}",
             "-p",
             f"127.0.0.1:{port}:5432",
             "-v",
@@ -236,6 +241,7 @@ def migrated_db(postgres_server, migrated_template_db):
                 f"@{postgres_server['host']}/{name}"
             ),
             "migrate_env": TEST_DB_PASSWORDS,
+            "repo_root": REPO_ROOT,
         }
     finally:
         _drop_database(postgres_server, name)

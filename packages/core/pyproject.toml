@@ -9,6 +9,7 @@ dependencies = [
 
 [project.scripts]
 agentforge-migrate = "agentforge_core.migrations:main"
+agentforge-registry = "agentforge_core.registry:main"
 
 [build-system]
 requires = ["hatchling"]
