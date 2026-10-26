@@ -16,6 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from agentforge_harness.gateway import ToolContext, ToolGateway
 from agentforge_harness.models import (
     ModelOutputError,
+    ModelProviderConfigurationError,
     ModelRequest,
     ModelResponse,
     generate_json,
@@ -74,9 +75,12 @@ class RuntimeModelRecorder:
         self._agent_version_id = agent_version_id
         self._provider = provider
         self._model_name = model_name
-        self._trace_id = lease.trace_id
+        self._started_at: dict[str, float] = {}
+        self._request_parameters: dict[str, dict[str, Any]] = {}
 
     async def record_started(self, invocation_key: str, request: ModelRequest) -> None:
+        self._started_at[invocation_key] = asyncio.get_running_loop().time()
+        self._request_parameters[invocation_key] = dict(request.provider_parameters)
         with span(
             "model.invocation",
             trace_id=self._lease.trace_id,
@@ -93,9 +97,10 @@ class RuntimeModelRecorder:
                 """
                 INSERT INTO harness.model_invocations
                     (id, task_id, attempt_id, invocation_key, agent_version_id,
-                     provider, model_name, context_hash, status, started_at, trace_id)
+                     provider, model_name, context_hash, status, started_at,
+                     provider_parameters, trace_id)
                 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8,
-                        'executing', now(), $9)
+                        'executing', now(), $9::jsonb, $10)
                 ON CONFLICT (task_id, invocation_key) DO NOTHING
                 """,
                 str(uuid.uuid4()),
@@ -106,6 +111,7 @@ class RuntimeModelRecorder:
                 self._provider,
                 self._model_name,
                 request.context_hash or _hash(request.messages),
+                _canonical(request.provider_parameters),
                 self._lease.trace_id,
             )
 
@@ -118,13 +124,36 @@ class RuntimeModelRecorder:
         error_code = None
         if error is not None:
             error_code = getattr(error, "code", type(error).__name__)
+        finished_at = asyncio.get_running_loop().time()
+        started_at = self._started_at.pop(invocation_key, finished_at)
+        elapsed_ms = max(0, round((finished_at - started_at) * 1000))
+        request_parameters = self._request_parameters.pop(invocation_key, {})
+        provider_request_id = (
+            response.provider_request_id
+            if response is not None and response.provider_request_id is not None
+            else getattr(error, "provider_request_id", None)
+        )
+        duration_ms = (
+            response.duration_ms
+            if response is not None and response.duration_ms > 0
+            else getattr(error, "duration_ms", 0) or elapsed_ms
+        )
+        response_parameters = (
+            response.provider_parameters
+            if response is not None and response.provider_parameters
+            else getattr(error, "provider_parameters", {})
+        )
+        if response_parameters:
+            request_parameters.update(response_parameters)
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE harness.model_invocations
                 SET status = $4, input_tokens = $5, output_tokens = $6,
-                    estimated_cost = $7, error_code = $8, finished_at = now(),
-                    trace_id = $9
+                    estimated_cost = $7, error_code = $8,
+                    provider_request_id = $9, duration_ms = $10,
+                    provider_parameters = $11::jsonb, trace_id = $12,
+                    finished_at = now()
                 WHERE task_id = $1::uuid AND invocation_key = $2
                   AND attempt_id = $3::uuid
                 """,
@@ -136,7 +165,10 @@ class RuntimeModelRecorder:
                 0 if response is None else response.output_tokens,
                 Decimal("0") if response is None else response.estimated_cost,
                 error_code,
-                self._trace_id,
+                provider_request_id,
+                duration_ms,
+                _canonical(request_parameters),
+                self._lease.trace_id,
             )
 
 
@@ -166,6 +198,11 @@ class AnalysisGraph:
             raise UnsupportedGraphError(
                 f"unsupported graph_key {agent['graph_key']!r}"
             )
+        adapter = (
+            self._model.resolve(agent)
+            if callable(getattr(self._model, "resolve", None))
+            else self._model
+        )
         recorder = RuntimeModelRecorder(
             pool=self._store.pool,
             lease=lease,
@@ -184,6 +221,7 @@ class AnalysisGraph:
                     messages=self._plan_messages(task),
                     schema=PLAN_SCHEMA,
                     timeout_seconds=model_timeout_seconds,
+                    provider_parameters=self._provider_parameters(agent),
                     max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "plan_metrics:0",
@@ -198,7 +236,7 @@ class AnalysisGraph:
                     }),
                 )
                 content, _ = await generate_json(
-                    self._model,
+                    adapter,
                     request,
                     PLAN_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
@@ -272,6 +310,7 @@ class AnalysisGraph:
                     messages=self._compose_messages(task, summaries),
                     schema=COMPOSE_SCHEMA,
                     timeout_seconds=model_timeout_seconds,
+                    provider_parameters=self._provider_parameters(agent),
                     max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "compose_analysis:0",
@@ -288,7 +327,7 @@ class AnalysisGraph:
                     }),
                 )
                 content, _ = await generate_json(
-                    self._model,
+                    adapter,
                     request,
                     COMPOSE_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
@@ -420,6 +459,18 @@ class AnalysisGraph:
         )
         return result
 
+    @staticmethod
+    def _provider_parameters(agent: dict[str, Any]) -> dict[str, Any]:
+        snapshot = agent.get("model_config_snapshot")
+        if not isinstance(snapshot, dict):
+            return {}
+        parameters = snapshot.get("config_json", {})
+        if not isinstance(parameters, dict):
+            raise ModelProviderConfigurationError(
+                "frozen model parameters must be an object"
+            )
+        return dict(parameters)
+
     def _model_timeout_seconds(self, agent: dict[str, Any]) -> float:
         snapshot_timeout = agent.get("timeout_ms")
         if (
@@ -452,7 +503,8 @@ class AnalysisGraph:
                     + _canonical(PLAN_SCHEMA)
                     + ". The task input is: "
                     + _canonical(task["input_json"])
-                    + ". Never write SQL."
+                    + '. Example json: {"metric":"gmv","metric_version":1}. '
+                    "Never write SQL."
                 ),
             },
             {"role": "user", "content": task["input_json"]["question"]},
@@ -469,8 +521,8 @@ class AnalysisGraph:
                     "You compose an analysis from platform-verified metrics. Return "
                     "only json matching this schema: "
                     + _canonical(COMPOSE_SCHEMA)
-                    + ". Every finding must cite at least one of these evidence "
-                    "ids: "
+                    + '. Example json: {"summary":"GMV changed","findings":[]}. '
+                    "Every finding must cite at least one of these evidence ids: "
                     + _canonical([item["evidence_id"] for item in evidence_summaries])
                     + ". Mark every hypothesis as unverified. Never invent numbers."
                 ),

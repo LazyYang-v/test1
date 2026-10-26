@@ -131,6 +131,36 @@ async def test_schema_invalid_output_is_repaired():
     assert content["metric"] == "gmv"
 
 
+@pytest.mark.parametrize(
+    "first_turn",
+    [
+        FakeScript(content="   "),
+        FakeScript(content='{"metric":"gmv"', finish_reason="length"),
+    ],
+)
+async def test_empty_and_truncated_outputs_are_repaired(first_turn):
+    valid_plan = {
+        "metric": "gmv",
+        "metric_version": 1,
+        "dimensions": ["region_code"],
+        "filters": {"region_code": ["CN_EAST"]},
+        "time_range": TASK_INPUT["date_range"],
+        "comparison": "previous_period",
+        "limit": 100,
+    }
+    model = FakeModel(
+        scripts={
+            "plan_metrics:0": [first_turn, FakeScript(content=valid_plan)],
+        }
+    )
+
+    content, responses = await generate_json(model, _request(), PLAN_SCHEMA, max_repairs=1)
+
+    assert content == valid_plan
+    assert len(responses) == 2
+    assert len(model.requests) == 2
+
+
 async def test_invalid_json_exhaustion_fails_explicitly():
     model = FakeModel(
         scripts={
@@ -170,3 +200,14 @@ async def test_recorder_captures_terminal_failure():
             model, _request(), PLAN_SCHEMA, max_repairs=0, recorder=recorder
         )
     assert recorder.finished[0][4] == "ModelOutputError"
+
+
+async def test_repair_exhaustion_is_classified_as_terminal():
+    from agentforge_worker.errors import is_retryable
+
+    model = FakeModel(scripts={"plan_metrics:0": [FakeScript(content="{broken")]})
+    with pytest.raises(ModelOutputError) as raised:
+        await generate_json(model, _request(), PLAN_SCHEMA, max_repairs=0)
+
+    assert raised.value.code == "MODEL_OUTPUT_INVALID"
+    assert is_retryable(raised.value.code) is False

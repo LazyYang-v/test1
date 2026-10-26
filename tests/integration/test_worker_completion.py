@@ -170,7 +170,8 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
     try:
         invocations = await conn.fetch(
             "SELECT invocation_key, status, input_tokens, output_tokens, trace_id, "
-            "estimated_cost FROM harness.model_invocations WHERE task_id = $1::uuid "
+            "estimated_cost, provider_request_id, provider_parameters, duration_ms "
+            "FROM harness.model_invocations WHERE task_id = $1::uuid "
             "ORDER BY started_at, invocation_key",
             task_id,
         )
@@ -186,6 +187,8 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
     assert all(row["trace_id"] == task_id for row in invocations)
     assert all(row["input_tokens"] > 0 and row["output_tokens"] > 0 for row in invocations)
     assert all(row["estimated_cost"] > 0 for row in invocations)
+    assert all(row["provider_request_id"].startswith("fake-") for row in invocations)
+    assert all(row["duration_ms"] >= 0 for row in invocations)
     assert len(tools) == 1 and tools[0]["status"] == "succeeded"
     assert tools[0]["result_hash"]
     assert tools[0]["trace_id"] == task_id
