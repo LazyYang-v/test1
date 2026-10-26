@@ -101,10 +101,12 @@ def _publish(migrated_db, version_id: str) -> dict:
     )
 
 
-async def test_registry_migration_is_schema_version_four(migrated_db):
+async def test_registry_migration_is_present_in_schema_version_five(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
-        version = await conn.fetchval("SELECT MAX(version) FROM agentforge.schema_migrations")
+        registry_migration_applied = await conn.fetchval(
+            "SELECT EXISTS (SELECT FROM agentforge.schema_migrations WHERE version = 4)"
+        )
         registry_tables = await conn.fetch(
             """
             SELECT table_name FROM information_schema.tables
@@ -139,7 +141,7 @@ async def test_registry_migration_is_schema_version_four(migrated_db):
     finally:
         await conn.close()
 
-    assert version == 4
+    assert registry_migration_applied is True
     assert {row["table_name"] for row in registry_tables} == {
         "model_profiles",
         "agent_versions",
