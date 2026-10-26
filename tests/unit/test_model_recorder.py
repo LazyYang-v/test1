@@ -40,6 +40,7 @@ async def test_invocation_record_keeps_provider_metadata_and_timing(failed):
             worker_id="worker-unit",
             lease_token="lease-token",
             fencing_epoch=1,
+            trace_id="trace-1",
         ),
         agent_version_id="agent-1",
         provider="deepseek",
@@ -85,8 +86,10 @@ async def test_invocation_record_keeps_provider_metadata_and_timing(failed):
     started = pool.connection.execute.await_args_list[0]
     finished = pool.connection.execute.await_args_list[1]
     assert "provider_parameters" in started.args[0]
-    assert '"temperature":0' in started.args[-1]
-    assert finished.args[0].count("$9") == 1
+    assert "trace_id" in started.args[0]
+    assert '"temperature":0' in started.args[-2]
+    assert started.args[-1] == "trace-1"
+    assert finished.args[0].count("$11") == 1 and finished.args[0].count("$12") == 1
     assert finished.args[1:4] == ("task-1", "step:model:0", "attempt-1")
     assert finished.args[4] == ("failed" if failed else "succeeded")
     assert finished.args[5] == (0 if failed else 15)
@@ -96,3 +99,4 @@ async def test_invocation_record_keeps_provider_metadata_and_timing(failed):
     assert finished.args[9] == "req-mocked-5"
     assert finished.args[10] == 42
     assert '"max_tokens":128' in finished.args[11]
+    assert finished.args[12] == "trace-1"
