@@ -8,7 +8,9 @@ The local defaults are for development only. Copy `.env.example` to `.env` and r
 docker compose up --build
 ```
 
-The API is available at `http://localhost:8000`. `/health/live` reports process liveness; `/health/ready` returns success only when PostgreSQL is reachable and the applied migration version matches this API. The PostgreSQL healthcheck probes TCP so the temporary Unix-socket-only initialization server cannot satisfy it.
+The API is available at `http://localhost:8000`; the React analysis workspace is available at `http://localhost:3000`. The web service proxies API requests to the API container under the same browser origin. `/health/live` reports process liveness; `/health/ready` returns success only when PostgreSQL is reachable and the applied migration version matches this API. The PostgreSQL healthcheck probes TCP so the temporary Unix-socket-only initialization server cannot satisfy it.
+
+The frontend uses bearer-authenticated `fetch` for the durable event stream because native browser `EventSource` cannot set the API's `Authorization` header. It reconnects with `Last-Event-ID` and deduplicates events by task sequence. See [apps/web/README.md](apps/web/README.md) for the UI and authentication details.
 
 The PostgreSQL init script creates `agentforge_migrator` as a non-superuser with `CREATEROLE`, assigns database ownership, and creates the separate `agentforge_registry_cli` login using `AGENTFORGE_REGISTRY_DB_PASSWORD`. This is one-time cluster bootstrap, executed only when the PostgreSQL data volume is first initialized. Migration 0001 creates the API, worker, business read-only, and evaluation roles. The one-shot migration job connects as `agentforge_migrator`; the API connects as `agentforge_api` and never runs migrations. If you change a password while keeping an existing database volume, update the corresponding role password in PostgreSQL to match.
 
