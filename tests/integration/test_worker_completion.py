@@ -169,13 +169,13 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
     conn = await asyncpg.connect(db["role_dsn"]("migrator"))
     try:
         invocations = await conn.fetch(
-            "SELECT invocation_key, status, input_tokens, output_tokens, "
+            "SELECT invocation_key, status, input_tokens, output_tokens, trace_id, "
             "estimated_cost FROM harness.model_invocations WHERE task_id = $1::uuid "
             "ORDER BY started_at, invocation_key",
             task_id,
         )
         tools = await conn.fetch(
-            "SELECT invocation_key, status, result_hash FROM harness.tool_invocations "
+            "SELECT invocation_key, status, result_hash, trace_id FROM harness.tool_invocations "
             "WHERE task_id = $1::uuid",
             task_id,
         )
@@ -183,14 +183,18 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
         await conn.close()
     assert len(invocations) == 2
     assert all(row["status"] == "succeeded" for row in invocations)
+    assert all(row["trace_id"] == task_id for row in invocations)
     assert all(row["input_tokens"] > 0 and row["output_tokens"] > 0 for row in invocations)
     assert all(row["estimated_cost"] > 0 for row in invocations)
     assert len(tools) == 1 and tools[0]["status"] == "succeeded"
     assert tools[0]["result_hash"]
+    assert tools[0]["trace_id"] == task_id
+    assert all(event["trace_id"] == task_id for event in events)
 
     audits = await fetch_audits(db, action="tool.invocation")
     assert len(audits) == 1
     assert audits[0]["decision"] == "allowed"
+    assert audits[0]["trace_id"] == task_id
     assert audits[0]["metadata"]["invocation_key"] == tools[0]["invocation_key"]
 
 
