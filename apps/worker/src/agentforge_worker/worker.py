@@ -45,12 +45,17 @@ class Worker:
         self.store = store
         self.model = model
         backend = PostgresToolGatewayBackend(store.pool, store)
+        self.executor = MetricsQueryExecutor(
+            settings.business_ro_db_dsn,
+            statement_timeout_ms=settings.business_ro_statement_timeout_ms,
+        )
         self.gateway = ToolGateway(
-            backend, {"metrics.query": MetricsQueryExecutor()}
+            backend, {"metrics.query": self.executor}
         )
         self.graph = graph or AnalysisGraph(store, model, self.gateway, settings)
 
     async def close(self) -> None:
+        await self.executor.close()
         await self.store.close()
 
     async def reconcile_once(self) -> dict[str, int]:

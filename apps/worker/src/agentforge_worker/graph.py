@@ -461,6 +461,7 @@ class AnalysisGraph:
 
     @staticmethod
     def _evidence_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+        query_plan = evidence.get("query_plan_json") or {}
         return {
             "evidence_id": evidence["evidence_id"],
             "metric": evidence["metric_key"],
@@ -475,10 +476,17 @@ class AnalysisGraph:
                 else f"{evidence['change_rate']:.4f}"
             ),
             "data_snapshot_id": evidence["data_snapshot_id"],
+            "annotations": list(query_plan.get("annotations") or []),
         }
 
     @staticmethod
     def _to_evidence(evidence: dict[str, Any]) -> Evidence:
+        query_plan = evidence.get("query_plan_json") or {}
+        annotations = tuple(
+            str(annotation)
+            for annotation in (query_plan.get("annotations") or [])
+            if isinstance(annotation, str)
+        )
         return Evidence(
             evidence_id=evidence["evidence_id"],
             task_id=evidence["task_id"],
@@ -495,4 +503,5 @@ class AnalysisGraph:
                 else Decimal(evidence["change_rate"])
             ),
             row_count=evidence["row_count"],
+            annotations=annotations,
         )

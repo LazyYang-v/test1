@@ -50,6 +50,7 @@ NODE_KEYS = [
 def _settings(db: dict, **overrides) -> WorkerSettings:
     values = {
         "worker_db_dsn": db["role_dsn"]("worker"),
+        "business_ro_db_dsn": db["role_dsn"]("business_ro"),
         "worker_id": "worker-completion",
         "heartbeat_interval_seconds": 0.05,
         "lease_seconds": 5,

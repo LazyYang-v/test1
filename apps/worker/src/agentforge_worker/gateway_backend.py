@@ -216,8 +216,12 @@ class PostgresToolGatewayBackend:
         request_hash: str,
         request_json: dict[str, Any],
         result: dict[str, Any],
+        query_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         result_json = _canonical(result)
+        query_plan_json = _canonical(
+            query_plan if query_plan is not None else request_json
+        )
         result_hash = _hash(result)
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -336,7 +340,7 @@ class PostgresToolGatewayBackend:
                         if result.get("change_rate") is None
                         else Decimal(str(result["change_rate"]))
                     ),
-                    _canonical(request_json),
+                    query_plan_json,
                     result_json,
                     result_hash,
                     result["row_count"],
