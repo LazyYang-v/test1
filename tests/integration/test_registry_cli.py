@@ -101,7 +101,7 @@ def _publish(migrated_db, version_id: str) -> dict:
     )
 
 
-async def test_registry_migration_is_present_in_schema_version_five(migrated_db):
+async def test_registry_migration_is_present_in_schema_version_six(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         registry_migration_applied = await conn.fetchval(
