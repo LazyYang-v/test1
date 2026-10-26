@@ -59,6 +59,8 @@ services:
     command: ["/app/.venv/bin/agentforge-worker"]
     environment:
       AGENTFORGE_WORKER_DB_DSN: postgresql://agentforge_worker:${AGENTFORGE_WORKER_DB_PASSWORD:-agentforge-local-worker}@postgres:5432/agentforge
+      AGENTFORGE_BUSINESS_RO_DB_DSN: postgresql://agentforge_business_ro:${AGENTFORGE_BUSINESS_RO_DB_PASSWORD:-agentforge-local-business-ro}@postgres:5432/agentforge
+      AGENTFORGE_BUSINESS_RO_STATEMENT_TIMEOUT_MS: ${AGENTFORGE_BUSINESS_RO_STATEMENT_TIMEOUT_MS:-3000}
       AGENTFORGE_WORKER_ID: ${AGENTFORGE_WORKER_ID:-worker-1}
       AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS: ${AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS:-5}
       AGENTFORGE_LEASE_SECONDS: ${AGENTFORGE_LEASE_SECONDS:-30}

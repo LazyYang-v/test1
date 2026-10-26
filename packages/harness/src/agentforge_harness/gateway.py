@@ -20,6 +20,7 @@ __all__ = [
     "ToolContext",
     "ToolDescriptor",
     "ToolError",
+    "ToolExecution",
     "ToolExecutor",
     "ToolGateway",
     "ToolGatewayBackend",
@@ -174,12 +175,27 @@ class ToolDescriptor:
     status: str
 
 
+@dataclass(frozen=True)
+class ToolExecution:
+    """Executor output plus the platform-owned redacted query plan.
+
+    The result is what the registered output schema validates and what becomes
+    the tool result. The query plan is persisted with Evidence and is never
+    model-supplied free text.
+    """
+
+    result: dict[str, Any]
+    query_plan: dict[str, Any]
+
+
 @runtime_checkable
 class ToolExecutor(Protocol):
     tool_key: str
     read_only: bool
 
-    async def execute(self, request: dict[str, Any], context: ToolContext) -> dict[str, Any]: ...
+    async def execute(
+        self, request: dict[str, Any], context: ToolContext
+    ) -> dict[str, Any] | ToolExecution: ...
 
 
 class ToolGatewayBackend(Protocol):
@@ -220,6 +236,7 @@ class ToolGatewayBackend(Protocol):
         request_hash: str,
         request_json: dict[str, Any],
         result: dict[str, Any],
+        query_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -366,7 +383,7 @@ class ToolGateway:
         assert executor is not None
         try:
             async with asyncio.timeout(descriptor.timeout_ms / 1000):
-                result = await executor.execute(request, context)
+                execution = await executor.execute(request, context)
         except TimeoutError as error:
             await reject("TOOL_TIMEOUT", "tool execution timed out", descriptor)
             raise AssertionError("unreachable") from error
@@ -379,7 +396,21 @@ class ToolGateway:
             )
             raise AssertionError("unreachable") from error
 
-        # 8. Validate output schema.
+        # 8. Validate output schema and the platform-owned query plan.
+        if isinstance(execution, ToolExecution):
+            result = execution.result
+            query_plan = execution.query_plan
+        else:
+            result = execution
+            # Legacy executors did not supply a plan; persisting the validated
+            # request keeps evidence provenance explicit.
+            query_plan = request
+        if not isinstance(result, dict) or not isinstance(query_plan, dict):
+            await reject(
+                "TOOL_OUTPUT_INVALID",
+                "executor output and query plan must be objects",
+                descriptor,
+            )
         try:
             validate_schema(
                 result, descriptor.output_schema, error_code="TOOL_OUTPUT_INVALID"
@@ -404,6 +435,7 @@ class ToolGateway:
             request_hash,
             request,
             result,
+            query_plan,
         )
         if accepted is None:
             await reject("LEASE_LOST", "lease was lost before result acceptance", descriptor)

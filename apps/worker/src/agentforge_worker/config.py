@@ -18,6 +18,12 @@ class WorkerSettings(BaseSettings):
     """The worker must connect as ``agentforge_worker`` and never as a superuser."""
 
     worker_db_dsn: str = "postgresql://agentforge_worker@localhost:5432/agentforge"
+    # The business query path never uses the worker role. It connects through a
+    # separate role that can only SELECT the authorized metric view.
+    business_ro_db_dsn: str = (
+        "postgresql://agentforge_business_ro@localhost:5432/agentforge"
+    )
+    business_ro_statement_timeout_ms: int = Field(default=3000, ge=100, le=15000)
     worker_id: str = Field(default_factory=_default_worker_id, min_length=1)
     heartbeat_interval_seconds: float = Field(default=5.0, gt=0)
     lease_seconds: float = Field(default=30.0, gt=0)
@@ -32,6 +38,15 @@ class WorkerSettings(BaseSettings):
     def require_worker_database_role(cls, value: str) -> str:
         if urlsplit(value).username != "agentforge_worker":
             raise ValueError("worker database DSN must use the agentforge_worker role")
+        return value
+
+    @field_validator("business_ro_db_dsn")
+    @classmethod
+    def require_business_read_only_role(cls, value: str) -> str:
+        if urlsplit(value).username != "agentforge_business_ro":
+            raise ValueError(
+                "business database DSN must use the agentforge_business_ro role"
+            )
         return value
 
     @model_validator(mode="after")
