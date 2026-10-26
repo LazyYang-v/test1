@@ -58,8 +58,8 @@ async def test_ready_requires_exact_migration_version(migrated_db):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 8,
-        "applied_schema_version": 8,
+        "expected_schema_version": 9,
+        "applied_schema_version": 9,
     }
 
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))

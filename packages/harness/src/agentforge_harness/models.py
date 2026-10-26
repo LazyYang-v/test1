@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Protocol
@@ -24,6 +25,11 @@ __all__ = [
     "ModelAdapter",
     "ModelError",
     "ModelOutputError",
+    "ModelProviderError",
+    "ModelProviderRateLimitedError",
+    "ModelProviderServerError",
+    "ModelProviderTimeoutError",
+    "ModelProviderUnavailableError",
     "ModelRequest",
     "ModelResponse",
     "ModelTimeoutError",
@@ -43,6 +49,28 @@ class ModelError(RuntimeError):
 
 class ModelTimeoutError(ModelError):
     code = "MODEL_TIMEOUT"
+
+
+class ModelProviderError(ModelError):
+    """A transient provider-side failure; the Runtime classifies the code."""
+
+    code = "MODEL_PROVIDER_ERROR"
+
+
+class ModelProviderTimeoutError(ModelProviderError):
+    code = "MODEL_PROVIDER_TIMEOUT"
+
+
+class ModelProviderUnavailableError(ModelProviderError):
+    code = "MODEL_PROVIDER_UNAVAILABLE"
+
+
+class ModelProviderRateLimitedError(ModelProviderError):
+    code = "MODEL_PROVIDER_RATE_LIMITED"
+
+
+class ModelProviderServerError(ModelProviderError):
+    code = "MODEL_PROVIDER_5XX"
 
 
 class ModelOutputError(ModelError):
@@ -265,12 +293,16 @@ async def generate_json(
     *,
     max_repairs: int = 2,
     recorder: ModelInvocationRecorder | None = None,
+    before_call: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any], list[ModelResponse]]:
     """Generate schema-valid JSON, repairing at most ``max_repairs`` times.
 
     Every physical adapter call is a distinct at-least-once model invocation. It
     is reported to the recorder before and after execution, including the failed
     attempts whose output did not validate, so cost accounting stays truthful.
+
+    ``before_call`` is awaited before every physical call (including repair
+    turns) so the Runtime can stop issuing calls after cancellation.
     """
     prefix = str(request.metadata.get("invocation_key_prefix", "model"))
     current = request
@@ -278,6 +310,8 @@ async def generate_json(
     problem = ""
 
     for call_index in range(max_repairs + 1):
+        if before_call is not None:
+            await before_call()
         invocation_key = f"{prefix}:{call_index}"
         if recorder is not None:
             await recorder.record_started(invocation_key, current)

@@ -17,6 +17,7 @@ class AttemptLease:
     lease_token: str
     fencing_epoch: int
     lease_expires_at: datetime | None = None
+    trace_id: str | None = None
 
 
 @dataclass(frozen=True)

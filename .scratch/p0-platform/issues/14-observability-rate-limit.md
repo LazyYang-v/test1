@@ -4,7 +4,9 @@
 
 **Blocked by:** 06
 
-**Status:** ready-for-agent
+**Status:** claimed
+
+2026-10-26: Implementation started on `ticket/14-observability-rate-limit-work` from `integration/p0` tip `ac8ee23`. Scope: additive Task trace ID migration 0009, structured redacted API/Worker logs, optional OTel readiness, and bounded per-principal API token-bucket limiting. Main seam: HTTP API with real PostgreSQL and deterministic fake-clock limiter tests. Full Docker suite deferred while ticket 08 verification is active.
 
 - [ ] 每个 Task 有 trace_id，出现在 API 日志、Worker 日志、model_invocations、tool_invocations、task_events、audit_events 中
 - [ ] 结构化 JSON 日志：无明文凭据、无完整敏感 Prompt、无多余业务原始数据
