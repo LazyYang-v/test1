@@ -6,7 +6,7 @@
 
 **Status:** claimed
 
-Integration: pending integration/p0 merge; implementation and review corrections verified on the ticket branch. Change Status to resolved after the merger integrates the verified branch.
+Integration: latest integration/p0 (`2b41af6`) is merged into this branch (`0b94c78`); pending final integration merge and full-suite verification by the coordinator. Keep Status claimed until those steps pass.
 
 - [x] 合法请求 202 + task_id + links；Task 状态 queued，task.created 事件落库
 - [x] agent_key 解析不到已发布版本 → 拒绝；region_codes 非当前授权子集 → 403 REGION_ACCESS_DENIED；日期范围超 90 天 → 拒绝
@@ -27,4 +27,4 @@ Verification after merging integration/p0 `2b41af6890e9b3c85ec267a82f8dbb74357ae
 - `uv run pytest -q --tb=short` → `83 passed in 211.49s (0:03:31)`; includes `test_registry_migration_is_present_in_schema_version_six`.
 - `git diff --check integration/p0...HEAD` → clean.
 
-Migrations 0001–0005 are unchanged. Integration is deliberately pending merger action; the separate Registry policy follow-up is tracked by ticket 04.
+Migrations 0001–0005 are unchanged. Ticket implementation is ready for coordinator merge; keep the ticket claimed until final integration merge and full-suite verification pass. The separate Registry policy follow-up is tracked by ticket 04.
