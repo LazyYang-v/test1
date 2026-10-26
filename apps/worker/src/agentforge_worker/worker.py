@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import random
 from typing import Any
 
@@ -271,10 +272,21 @@ class Worker:
         else:
             await self.store.abandon_attempt(lease, error_code=error.code)
 
-    def _retry_delay(self) -> float:
-        return self.settings.retry_base_delay_seconds + random.uniform(
+    def _retry_delay(self, error: BaseException | None = None) -> float:
+        delay = self.settings.retry_base_delay_seconds + random.uniform(
             0, self.settings.retry_jitter_seconds
         )
+        if error is None:
+            return delay
+        retry_after = getattr(error, "retry_after_seconds", None)
+        if (
+            isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            and math.isfinite(float(retry_after))
+            and retry_after >= 0
+        ):
+            return max(delay, float(retry_after))
+        return delay
 
     async def _handle_failure(
         self, lease: AttemptLease, error: BaseException
@@ -301,7 +313,7 @@ class Worker:
                     lease,
                     code,
                     str(error),
-                    delay_seconds=self._retry_delay(),
+                    delay_seconds=self._retry_delay(error),
                 )
                 logger.info(
                     "retryable failure handled",

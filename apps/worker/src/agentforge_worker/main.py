@@ -10,10 +10,10 @@ import asyncpg
 from agentforge_core.migrations import fetch_applied_version
 from agentforge_core.schema_version import SCHEMA_VERSION
 
-from agentforge_harness.models import FakeModel
 from agentforge_runtime.store import RuntimeStore
 
 from agentforge_worker.config import WorkerSettings
+from agentforge_worker.model_factory import SnapshotModelAdapterFactory
 from agentforge_worker.worker import Worker
 
 
@@ -42,7 +42,12 @@ async def _run() -> None:
         worker_id=settings.worker_id,
         lease_seconds=settings.lease_seconds,
     )
-    worker = Worker(settings, store, FakeModel())
+    model_factory = SnapshotModelAdapterFactory(settings)
+    worker = Worker(
+        settings,
+        store,
+        model_factory,
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -59,6 +64,7 @@ async def _run() -> None:
         stop_task.cancel()
         await asyncio.gather(run, stop_task, return_exceptions=True)
         await worker.close()
+        await model_factory.aclose()
 
 
 def main() -> None:

@@ -34,6 +34,14 @@ class WorkerSettings(BaseSettings):
     max_model_repairs: int = Field(default=2, ge=0, le=5)
     model_timeout_seconds: float = Field(default=60.0, gt=0)
     model_provider: str = "fake"
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_input_cost_per_million: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )
+    deepseek_output_cost_per_million: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )
     max_concurrent_tasks: int = Field(default=1, ge=1, le=16)
 
     @field_validator("worker_db_dsn")
@@ -51,6 +59,30 @@ class WorkerSettings(BaseSettings):
                 "business database DSN must use the agentforge_business_ro role"
             )
         return value
+
+    @field_validator("model_provider")
+    @classmethod
+    def require_supported_model_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"fake", "deepseek"}:
+            raise ValueError("model provider must be 'fake' or 'deepseek'")
+        return normalized
+
+    @field_validator("deepseek_base_url")
+    @classmethod
+    def require_credential_free_https_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.startswith("/")
+        ):
+            raise ValueError("DeepSeek base URL must be a credential-free HTTPS URL")
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def require_heartbeat_before_expiry(self):
