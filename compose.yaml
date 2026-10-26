@@ -54,5 +54,23 @@ services:
     tmpfs:
       - /tmp
 
+  worker:
+    build: .
+    command: ["/app/.venv/bin/agentforge-worker"]
+    environment:
+      AGENTFORGE_WORKER_DB_DSN: postgresql://agentforge_worker:${AGENTFORGE_WORKER_DB_PASSWORD:-agentforge-local-worker}@postgres:5432/agentforge
+      AGENTFORGE_WORKER_ID: ${AGENTFORGE_WORKER_ID:-worker-1}
+      AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS: ${AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS:-5}
+      AGENTFORGE_LEASE_SECONDS: ${AGENTFORGE_LEASE_SECONDS:-30}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+
 volumes:
   postgres_data:
