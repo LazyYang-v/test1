@@ -635,7 +635,20 @@ async def get_task(
             """
             SELECT task.id::text AS task_id, task.task_type, task.status,
                    task.version, task.current_attempt_no, task.result_json,
+                   task.region_scope_json,
                    task.error_code, task.error_message, task.created_at,
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements_text(task.region_scope_json)
+                            AS scope(region_code)
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM identity.region_grants AS grant_row
+                           WHERE grant_row.user_id = task.owner_user_id
+                             AND grant_row.region_code = scope.region_code
+                             AND grant_row.revoked_at IS NULL
+                             AND grant_row.permission IN ('read', 'admin')
+                       )
+                   ) AS live_region_access,
                    task.updated_at, task.completed_at,
                    EXISTS (
                        SELECT 1 FROM runtime.task_events AS event
@@ -657,6 +670,13 @@ async def get_task(
     if row is None:
         raise ApiError(404, "TASK_NOT_FOUND", "Task not found")
     result = dict(row)
+    live_region_access = result["live_region_access"]
+    stored_result = _json_value(result["result_json"])
+    if not live_region_access:
+        # Authorization snapshots document the grant at creation time only.
+        # Stored result and error details remain available only while every
+        # task region has a live read/admin grant for the owner.
+        stored_result = None
     # The request event is durable immediately; the Worker state machine
     # materializes the status column shortly after. Project the externally
     # visible state so clients never observe a cancelled Task as runnable.
@@ -676,10 +696,14 @@ async def get_task(
         "version": result["version"],
         "current_attempt_no": result["current_attempt_no"],
         "progress": {"current_step": None, "completed_steps": 0, "total_steps": 4},
-        "result": _json_value(result["result_json"]),
+        "result": stored_result,
         "error": (
             {"code": result["error_code"], "message": result["error_message"]}
-            if result["error_code"] is not None or result["error_message"] is not None
+            if live_region_access
+            and (
+                result["error_code"] is not None
+                or result["error_message"] is not None
+            )
             else None
         ),
         "created_at": result["created_at"],

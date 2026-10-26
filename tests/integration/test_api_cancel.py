@@ -6,6 +6,7 @@ import asyncio
 
 import asyncpg
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from agentforge_harness.models import FakeModel
 from agentforge_runtime.store import RuntimeStore
@@ -23,6 +24,9 @@ from worker_support import (
     post_cancel_via_api,
     seed_agent,
     wait_until,
+    app_for,
+    token,
+    USER_ID,
 )
 
 pytestmark = pytest.mark.integration
@@ -249,6 +253,71 @@ async def test_running_cancel_stops_worker_before_any_new_model_call(migrated_db
         assert await later.run_once() is False
     finally:
         await later.close()
+
+
+async def test_completed_result_is_hidden_after_live_region_grant_revocation(migrated_db):
+    db = migrated_db
+    task_id = await _prepared_task(db)
+    worker = await _worker(db, FakeModel())
+    try:
+        assert await worker.run_once() is True
+    finally:
+        await worker.close()
+
+    completed = await get_task_via_api(db, task_id)
+    assert completed["status"] == "completed"
+    assert completed["result"] is not None
+
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "UPDATE identity.region_grants SET revoked_at = now() "
+            "WHERE user_id = $1::uuid AND region_code = 'CN_EAST' "
+            "AND revoked_at IS NULL",
+            USER_ID,
+        )
+    finally:
+        await conn.close()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app_for(db)), base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {token()}"},
+        )
+
+    # Keep the owner's task discoverable while redacting historical data whose
+    # live authorization has been revoked, including potentially sensitive
+    # error details.
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    assert detail["status"] == "completed"
+    assert detail["result"] is None
+    assert detail["error"] is None
+
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "UPDATE runtime.tasks SET status = 'failed', "
+            "error_code = 'REPORT_PRIVATE_DETAIL', "
+            "error_message = 'sensitive regional value' WHERE id = $1::uuid",
+            task_id,
+        )
+    finally:
+        await conn.close()
+    async with AsyncClient(
+        transport=ASGITransport(app=app_for(db)), base_url="http://testserver"
+    ) as client:
+        failed_response = await client.get(
+            f"/api/v1/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {token()}"},
+        )
+    assert failed_response.status_code == 200
+    failed_detail = failed_response.json()
+    assert failed_detail["status"] == "failed"
+    assert failed_detail["result"] is None
+    assert failed_detail["error"] is None
 
 
 async def test_cancel_reason_is_required(migrated_db):
