@@ -4,7 +4,7 @@
 
 **Blocked by:** 06
 
-**Status:** claimed
+**Status:** resolved
 
 - [x] GMV 查询经只读角色执行：参数化绑定、区域强制注入、授权区域混合数据下只返回授权区域（BA-08）
 - [x] 每次查询产出 Evidence 并持久化：查询计划（脱敏）、结果集哈希、行数、快照 ID；同一 Task 内全部证据快照一致
@@ -30,3 +30,7 @@
 - Replay: two identical `ToolGateway.invoke` calls with the same `(task_id, invocation_key)` return `reused=False` then `reused=True` with identical result/evidence id; a counting executor records one execution, and the database has one succeeded tool invocation and one Evidence row.
 - Deviations: `harness.evidences` has no annotations column and 0008 is immutable, so `ZERO_BASELINE`/`DATA_INSUFFICIENT` live in the platform-owned `query_plan_json`; `build_report` deterministically turns them into report limitations. The focused GMV template validates `dimensions` against the registered schema but returns one authorized-scope total (per-dimension grouping stays in ticket 10).
 - Status left `claimed`; integration verification and resolution remain with the merger.
+
+## Resolution
+
+2026-10-26: Resolved by merge commit `88c9add6bb90af618570b303a6b8396cdcba1142` (merge of `ticket/07-real-metrics-evidence` tip `bf0c320` into `integration/p0` tip `1cf9f50`, no conflicts). Post-merge Verification on `integration/p0` at `88c9add`: `uv run pytest -q --tb=short` -> `376 passed in 421.75s (0:07:01)`, exit code 0, real Docker PostgreSQL with the continuous migration sequence 0001-0008; `git diff --check HEAD^1...HEAD` clean. No migrations 0001-0008 were modified and `SCHEMA_VERSION` remains 8. Scope is limited to ticket 07; tickets 08-16, live DeepSeek, and the Release Gate are not claimed by this ticket.
