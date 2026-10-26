@@ -56,6 +56,7 @@ class ModelRequest:
     timeout_seconds: float
     metadata: dict[str, Any] = field(default_factory=dict)
     context_hash: str = ""
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)

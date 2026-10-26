@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from decimal import Decimal
 
 import asyncpg
@@ -26,6 +27,7 @@ from worker_support import (
     fetch_steps,
     fetch_task,
     get_task_via_api,
+    registry_cli,
     seed_agent,
 )
 
@@ -382,6 +384,88 @@ async def test_foreign_task_evidence_reference_is_rejected(migrated_db):
     assert task["error_code"] == "REPORT_EVIDENCE_FOREIGN"
     assert await fetch_task(db, other_task_id) is not None
     assert other_agent["agent_key"] == "other-report"
+
+
+async def test_worker_uses_frozen_agent_snapshot_not_mutable_profile(migrated_db):
+    db = migrated_db
+    seeded = await seed_agent(
+        db,
+        agent_key="snapshot-report",
+        published=False,
+        profile_timeout_ms=50,
+    )
+    published = registry_cli(
+        db,
+        "agent",
+        "publish",
+        "--version-id",
+        seeded["agent_id"],
+        "--actor-id",
+        str(uuid.uuid4()),
+    )
+    assert published["model_config_snapshot"]["provider"] == "fake"
+    assert published["model_config_snapshot"]["model_name"] == "fake-v1"
+    assert published["model_config_snapshot"]["timeout_ms"] == 50
+    await complete_dataset_load(db)
+
+    # The profile row is mutable; published Agent runs must ignore these changes.
+    registry = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    try:
+        await registry.execute(
+            "UPDATE registry.model_profiles "
+            "SET provider = 'mutated-provider', model_name = 'mutated-model', "
+            "    timeout_ms = 5000 WHERE id = $1::uuid",
+            seeded["profile_id"],
+        )
+    finally:
+        await registry.close()
+
+    task_id = await create_task_via_api(db, "snapshot-report")
+    plan = {
+        "metric": "gmv",
+        "metric_version": 1,
+        "dimensions": ["region_code"],
+        "filters": {"region_code": ["CN_EAST"]},
+        "time_range": dict(FROZEN_DATE_RANGE),
+        "comparison": "previous_period",
+        "limit": 100,
+    }
+    model = FakeModel(
+        scripts={
+            "plan_metrics:0": [
+                FakeScript(content=plan, delay_seconds=0.2)
+            ]
+        }
+    )
+
+    assert await _run_worker(db, model) is True
+
+    # Frozen 50ms timeout wins over the mutated 5000ms profile timeout.
+    task = await fetch_task(db, task_id)
+    assert task["status"] == "failed"
+    assert task["error_code"] == "MODEL_TIMEOUT"
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        invocations = await conn.fetch(
+            "SELECT provider, model_name FROM harness.model_invocations "
+            "WHERE task_id = $1::uuid ORDER BY started_at, invocation_key",
+            task_id,
+        )
+        profile = await conn.fetchrow(
+            "SELECT provider, model_name, timeout_ms FROM registry.model_profiles "
+            "WHERE id = $1::uuid",
+            seeded["profile_id"],
+        )
+    finally:
+        await conn.close()
+    assert dict(profile) == {
+        "provider": "mutated-provider",
+        "model_name": "mutated-model",
+        "timeout_ms": 5000,
+    }
+    assert [dict(row) for row in invocations] == [
+        {"provider": "fake", "model_name": "fake-v1"}
+    ]
 
 
 async def test_result_json_is_persisted_and_events_stay_contiguous(migrated_db):

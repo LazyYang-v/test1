@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import uuid
 from typing import Any
 
@@ -54,6 +56,7 @@ async def seed_agent(
     bind_tool: bool = True,
     grants: tuple[str, ...] = ("CN_EAST",),
     published: bool = True,
+    profile_timeout_ms: int = 2500,
 ) -> dict[str, str]:
     suffix = uuid.uuid4().hex[:8]
     profile_id = str(uuid.uuid4())
@@ -85,10 +88,11 @@ async def seed_agent(
                 (id, profile_key, provider, model_name, endpoint_alias,
                  credential_ref, timeout_ms, max_output_tokens)
             VALUES ($1::uuid, $2, 'fake', 'fake-v1', 'fake-local',
-                    'secret://agentforge/test/fake-provider', 2500, 768)
+                    'secret://agentforge/test/fake-provider', $3, 768)
             """,
             profile_id,
             f"{agent_key}-{suffix}",
+            profile_timeout_ms,
         )
         await conn.execute(
             """
@@ -123,6 +127,23 @@ async def seed_agent(
     finally:
         await conn.close()
     return {"agent_id": agent_id, "agent_key": agent_key, "profile_id": profile_id}
+
+
+def registry_cli(db: dict, *args: str) -> dict[str, Any]:
+    """Run the real Registry CLI, which freezes the profile into a snapshot."""
+    env = os.environ.copy()
+    env["AGENTFORGE_REGISTRY_DSN"] = db["role_dsn"]("registry_cli")
+    executable = db["repo_root"] / ".venv" / "bin" / "agentforge-registry"
+    process = subprocess.run(
+        [str(executable), *args],
+        cwd=db["repo_root"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    return json.loads(process.stdout)
 
 
 def token(user_id: str = USER_ID) -> str:

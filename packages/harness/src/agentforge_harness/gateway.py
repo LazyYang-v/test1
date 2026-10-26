@@ -113,7 +113,11 @@ def merge_policy(
                 raise ToolPolicyError(f"{key} may only narrow the allowed set")
             merged[key] = value
         elif key.startswith("require_"):
-            if base_value is not True or value is not True:
+            if (
+                not isinstance(base_value, bool)
+                or not isinstance(value, bool)
+                or value is not True
+            ):
                 raise ToolPolicyError(f"{key} may only be required")
             merged[key] = True
         elif key.startswith("allow_"):

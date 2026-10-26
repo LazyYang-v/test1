@@ -229,8 +229,40 @@ class RuntimeStore:
         if row is None:
             raise LookupError(f"agent version {agent_version_id} not found")
         result = dict(row)
-        for field in ("model_config_snapshot", "config_json"):
-            result[field] = _json_value(result[field])
+        result["model_config_snapshot"] = _json_value(result["model_config_snapshot"])
+        result["config_json"] = _json_value(result["config_json"])
+
+        # Runtime behavior comes from the immutable publication snapshot. The
+        # mutable profile row is only a fallback for legacy/draft rows whose
+        # snapshot predates the frozen provider/timeout fields.
+        snapshot = result["model_config_snapshot"]
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        provider = snapshot.get("provider")
+        model_name = snapshot.get("model_name") or snapshot.get("model")
+        timeout_ms = snapshot.get("timeout_ms")
+        max_output_tokens = snapshot.get("max_output_tokens")
+        result["provider"] = (
+            provider if isinstance(provider, str) and provider else result["provider"]
+        )
+        result["model_name"] = (
+            model_name
+            if isinstance(model_name, str) and model_name
+            else result["model_name"]
+        )
+        result["timeout_ms"] = (
+            timeout_ms
+            if isinstance(timeout_ms, int) and not isinstance(timeout_ms, bool)
+            and timeout_ms > 0
+            else result["timeout_ms"]
+        )
+        result["max_output_tokens"] = (
+            max_output_tokens
+            if isinstance(max_output_tokens, int)
+            and not isinstance(max_output_tokens, bool)
+            and max_output_tokens > 0
+            else result["max_output_tokens"]
+        )
         return result
 
     async def get_confirmed_step(self, task_id: str, step_key: str) -> StepRecord | None:

@@ -35,6 +35,32 @@ def test_policy_override_may_only_tighten():
     ) == {"max_calls": 3, "allowed_metrics": ["gmv"]}
 
 
+def test_require_override_may_tighten_false_to_true():
+    assert merge_policy(
+        {"require_approval": False}, {"require_approval": True}
+    ) == {"require_approval": True}
+
+
+def test_require_override_may_keep_true():
+    assert merge_policy(
+        {"require_approval": True}, {"require_approval": True}
+    ) == {"require_approval": True}
+
+
+@pytest.mark.parametrize(
+    "base,override",
+    [
+        (False, False),
+        (True, False),
+        ("false", True),
+        (False, "true"),
+    ],
+)
+def test_require_override_must_be_a_true_boolean(base, override):
+    with pytest.raises(ToolPolicyError):
+        merge_policy({"require_approval": base}, {"require_approval": override})
+
+
 @pytest.mark.parametrize(
     "override",
     [

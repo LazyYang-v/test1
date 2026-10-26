@@ -153,13 +153,16 @@ class AnalysisGraph:
             provider=agent["provider"],
             model_name=agent["model_name"],
         )
+        model_timeout_seconds = self._model_timeout_seconds(agent)
+        max_output_tokens = agent.get("max_output_tokens")
 
         async def plan_node(state: AnalysisState) -> dict[str, Any]:
             async def work() -> dict[str, Any]:
                 request = ModelRequest(
                     messages=self._plan_messages(task),
                     schema=PLAN_SCHEMA,
-                    timeout_seconds=self._settings.model_timeout_seconds,
+                    timeout_seconds=model_timeout_seconds,
+                    max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "plan_metrics:0",
                         "invocation_key_prefix": (
@@ -236,7 +239,8 @@ class AnalysisGraph:
                 request = ModelRequest(
                     messages=self._compose_messages(task, summaries),
                     schema=COMPOSE_SCHEMA,
-                    timeout_seconds=self._settings.model_timeout_seconds,
+                    timeout_seconds=model_timeout_seconds,
+                    max_output_tokens=max_output_tokens,
                     metadata={
                         "step_key": "compose_analysis:0",
                         "invocation_key_prefix": (
@@ -362,6 +366,19 @@ class AnalysisGraph:
             result=result,
         )
         return result
+
+    def _model_timeout_seconds(self, agent: dict[str, Any]) -> float:
+        snapshot_timeout = agent.get("timeout_ms")
+        if (
+            isinstance(snapshot_timeout, int)
+            and not isinstance(snapshot_timeout, bool)
+            and snapshot_timeout > 0
+        ):
+            return min(
+                snapshot_timeout / 1000.0,
+                self._settings.model_timeout_seconds,
+            )
+        return self._settings.model_timeout_seconds
 
     @staticmethod
     def _error_code(error: BaseException) -> str:
