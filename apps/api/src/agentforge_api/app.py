@@ -24,6 +24,7 @@ from agentforge_api.auth import (
 )
 from agentforge_api.config import Settings
 from agentforge_api.evaluations import router as evaluation_router
+from agentforge_core.faults import NOOP_FAULT_INJECTOR
 from agentforge_api.readiness import check_database_readiness
 from agentforge_api.observability import (
     configure_json_logging,
@@ -149,6 +150,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="AgentForge API", lifespan=lifespan)
     app.include_router(task_router)
     app.include_router(evaluation_router)
+    # Fault hooks are an optional deterministic test seam, inert in production.
+    app.state.fault_injector = NOOP_FAULT_INJECTOR
     # ASGI tests may use HTTPX's ASGITransport without starting lifespan.
     app.state.settings = app_settings
     app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)

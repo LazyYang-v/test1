@@ -19,6 +19,13 @@ from agentforge_core.evaluation import evaluate_case
 
 from agentforge_runtime.contracts import AttemptLease, StepRecord
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
+from agentforge_core.faults import (
+    FaultInjector,
+    FaultPoint,
+    InjectedCrash,
+    NOOP_FAULT_INJECTOR,
+)
+from agentforge_runtime.recovery import validate_recovery_records
 
 CANCEL_REQUEST_EVENT = "task.cancel.requested"
 TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -59,10 +66,12 @@ class RuntimeStore:
         *,
         worker_id: str,
         lease_seconds: float = 30.0,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self.pool = pool
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.fault_injector = fault_injector or NOOP_FAULT_INJECTOR
 
     async def close(self) -> None:
         await self.pool.close()
@@ -172,7 +181,15 @@ class RuntimeStore:
                         "fencing_epoch": attempt_no,
                     },
                 )
-                return _row_to_lease(row)
+                lease = _row_to_lease(row)
+        try:
+            await self.fault_injector.checkpoint(
+                FaultPoint.ATTEMPT_CLAIMED,
+                {"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+            )
+        except InjectedCrash:
+            raise
+        return lease
 
     async def heartbeat(self, lease: AttemptLease) -> bool:
         """Renew the lease by a fixed interval using database time.
@@ -432,6 +449,76 @@ class RuntimeStore:
             for row in rows
         ]
 
+    async def _recovery_diagnostic(
+        self,
+        conn: asyncpg.Connection,
+        task_id: str,
+        data_snapshot_id: str,
+    ) -> str | None:
+        """Read the durable replay ledger under the Task recovery lock."""
+        step_rows = await conn.fetch(
+            """
+            SELECT step_key, graph_node_key, status, result_json, result_hash,
+                   owning_attempt_id::text AS owning_attempt_id, fencing_epoch
+            FROM runtime.step_executions
+            WHERE task_id = $1::uuid
+            ORDER BY started_at, step_key
+            """,
+            task_id,
+        )
+        invocation_rows = await conn.fetch(
+            """
+            SELECT invocation.id::text AS invocation_id,
+                   invocation.status, invocation.result_json,
+                   invocation.result_hash,
+                   evidence.id::text AS evidence_id,
+                   evidence.metric_key, evidence.metric_version, evidence.unit,
+                   evidence.current_value, evidence.previous_value,
+                   evidence.absolute_change, evidence.change_rate,
+                   evidence.row_count, evidence.query_plan_json,
+                   evidence.result_json AS evidence_result_json,
+                   evidence.result_set_hash AS evidence_result_hash,
+                   evidence.data_snapshot_id AS evidence_snapshot_id,
+                   evidence.tool_invocation_id::text AS evidence_invocation_id
+            FROM harness.tool_invocations AS invocation
+            LEFT JOIN harness.evidences AS evidence
+              ON evidence.tool_invocation_id = invocation.id
+            WHERE invocation.task_id = $1::uuid
+            ORDER BY invocation.started_at, invocation.invocation_key
+            """,
+            task_id,
+        )
+        evidence_rows = await conn.fetch(
+            """
+            SELECT id::text AS evidence_id, tool_invocation_id::text AS tool_invocation_id,
+                   metric_key, metric_version, unit, current_value, previous_value,
+                   absolute_change, change_rate, row_count, query_plan_json,
+                   result_json, result_set_hash AS result_hash, data_snapshot_id
+            FROM harness.evidences
+            WHERE task_id = $1::uuid
+            """,
+            task_id,
+        )
+        return validate_recovery_records(
+            [
+                {**dict(row), "result_json": _json_value(row["result_json"])}
+                for row in step_rows
+            ],
+            [
+                {**dict(row), "result_json": _json_value(row["result_json"])}
+                for row in invocation_rows
+            ],
+            [
+                {
+                    **dict(row),
+                    "result_json": _json_value(row["result_json"]),
+                    "query_plan_json": _json_value(row["query_plan_json"]),
+                }
+                for row in evidence_rows
+            ],
+            data_snapshot_id=data_snapshot_id,
+        )
+
     # -- fenced lifecycle writes ----------------------------------------
 
     async def confirm_step(
@@ -512,6 +599,14 @@ class RuntimeStore:
                         lease.attempt_id,
                         lease.fencing_epoch,
                     )
+                await self.fault_injector.checkpoint(
+                    FaultPoint.STEP_CONFIRM_BEFORE_COMMIT,
+                    {
+                        "task_id": lease.task_id,
+                        "attempt_id": lease.attempt_id,
+                        "step_key": step_key,
+                    },
+                )
                 await self._append_event(
                     conn,
                     task_id=lease.task_id,
@@ -524,6 +619,14 @@ class RuntimeStore:
                         "status": "confirmed",
                     },
                 )
+        await self.fault_injector.checkpoint(
+            FaultPoint.STEP_CONFIRMED,
+            {
+                "task_id": lease.task_id,
+                "attempt_id": lease.attempt_id,
+                "step_key": step_key,
+            },
+        )
         return StepRecord(
             step_key=step_key,
             graph_node_key=graph_node_key,
@@ -604,6 +707,10 @@ class RuntimeStore:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await self._require_running_task(conn, lease)
+                await self.fault_injector.checkpoint(
+                    FaultPoint.TERMINAL_BEFORE_COMMIT,
+                    {"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                )
                 await conn.execute(
                     """
                     UPDATE runtime.tasks
@@ -1205,6 +1312,7 @@ class RuntimeStore:
                     task = await conn.fetchrow(
                         """
                         SELECT status, current_attempt_no, max_attempts,
+                               data_snapshot_id,
                                (deadline_at IS NOT NULL
                                 AND deadline_at <= now()) AS expired,
                                cancel_requested_at,
@@ -1236,6 +1344,15 @@ class RuntimeStore:
                     if running:
                         continue
                     await self._lock_events(conn, task_id)
+                    diagnostic = None
+                    if (
+                        not self._has_cancel_request(task)
+                        and task["current_attempt_no"] < task["max_attempts"]
+                        and not task["expired"]
+                    ):
+                        diagnostic = await self._recovery_diagnostic(
+                            conn, task_id, task["data_snapshot_id"]
+                        )
                     if self._has_cancel_request(task):
                         await conn.execute(
                             """
@@ -1260,10 +1377,37 @@ class RuntimeStore:
                                 "source": "scanner",
                             },
                         )
+                    elif diagnostic is not None:
+                        detail = f"recovery state is inconsistent: {diagnostic}"
+                        await conn.execute(
+                            """
+                            UPDATE runtime.tasks
+                            SET status = 'failed', error_code = 'RECOVERY_STATE_INVALID',
+                                error_message = $2, completed_at = now(),
+                                updated_at = now(), version = version + 1
+                            WHERE id = $1::uuid
+                            """,
+                            task_id,
+                            detail[:2000],
+                        )
+                        await self._append_event(
+                            conn,
+                            task_id=task_id,
+                            attempt_id=None,
+                            event_type="task.failed",
+                            payload={
+                                "error_code": "RECOVERY_STATE_INVALID",
+                                "error_detail": detail[:2000],
+                            },
+                        )
                     elif (
                         task["current_attempt_no"] < task["max_attempts"]
                         and not task["expired"]
                     ):
+                        await self.fault_injector.checkpoint(
+                            FaultPoint.RECOVERY_SCAN_BEFORE_COMMIT,
+                            {"task_id": task_id, "status": "queued"},
+                        )
                         await conn.execute(
                             """
                             UPDATE runtime.tasks

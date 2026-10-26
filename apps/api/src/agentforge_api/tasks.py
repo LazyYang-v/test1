@@ -20,6 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
+from agentforge_core.faults import FaultPoint
 from agentforge_core.observability import log_event, span
 
 logger = logging.getLogger("agentforge.api")
@@ -430,6 +431,14 @@ async def create_task(
                 task_id,
                 _canonical(response),
             )
+            await request.app.state.fault_injector.checkpoint(
+                FaultPoint.TASK_CREATE_BEFORE_COMMIT,
+                {"task_id": task_id, "idempotency_key": idempotency_key},
+            )
+    await request.app.state.fault_injector.checkpoint(
+        FaultPoint.TASK_CREATE_AFTER_COMMIT,
+        {"task_id": task_id, "idempotency_key": idempotency_key},
+    )
     with span("task.create", trace_id=task_id, task_id=task_id):
         log_event(
             logger,

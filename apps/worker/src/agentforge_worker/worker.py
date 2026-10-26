@@ -15,6 +15,7 @@ import random
 from typing import Any
 
 from agentforge_harness.gateway import ToolGateway
+from agentforge_core.faults import FaultInjector, InjectedCrash, NOOP_FAULT_INJECTOR
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_runtime.store import RuntimeStore
@@ -42,11 +43,18 @@ class Worker:
         model,
         *,
         graph: AnalysisGraph | None = None,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.model = model
-        backend = PostgresToolGatewayBackend(store.pool, store)
+        self.fault_injector = (
+            fault_injector or store.fault_injector or NOOP_FAULT_INJECTOR
+        )
+        self.store.fault_injector = self.fault_injector
+        backend = PostgresToolGatewayBackend(
+            store.pool, store, fault_injector=self.fault_injector
+        )
         self.executor = MetricsQueryExecutor(
             settings.business_ro_db_dsn,
             statement_timeout_ms=settings.business_ro_statement_timeout_ms,
@@ -54,7 +62,13 @@ class Worker:
         self.gateway = ToolGateway(
             backend, {"metrics.query": self.executor}
         )
-        self.graph = graph or AnalysisGraph(store, model, self.gateway, settings)
+        self.graph = graph or AnalysisGraph(
+            store,
+            model,
+            self.gateway,
+            settings,
+            fault_injector=self.fault_injector,
+        )
 
     async def close(self) -> None:
         await self.executor.close()
@@ -64,6 +78,8 @@ class Worker:
         """Run the state-machine sweep; failures must not stop claiming."""
         try:
             return await self.store.reconcile()
+        except InjectedCrash:
+            raise
         except Exception:  # pragma: no cover - defensive loop guard
             log_event(
                 logger,
@@ -184,6 +200,9 @@ class Worker:
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
+            if graph_task.done() and isinstance(graph_task.exception(), InjectedCrash):
+                raise graph_task.exception()
+
             if heartbeat_failed.is_set():
                 await self._stop_graph(graph_task)
                 log_event(
@@ -231,6 +250,8 @@ class Worker:
             except TaskNotRunningError as error:
                 await self._handle_refusal(lease, error)
                 return
+            except InjectedCrash:
+                raise
             except BaseException as error:
                 await self._handle_failure(lease, error)
                 return

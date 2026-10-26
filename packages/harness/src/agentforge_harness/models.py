@@ -23,11 +23,17 @@ import httpx
 
 from jsonschema import Draft202012Validator
 
+from agentforge_core.faults import (
+    FaultInjector,
+    FaultPoint,
+    NOOP_FAULT_INJECTOR,
+)
 from agentforge_harness.schemas import COMPOSE_SCHEMA, PLAN_SCHEMA
 
 __all__ = [
     "DeepSeekModel",
     "FakeModel",
+    "FaultInjector",
     "FakeScript",
     "ModelAdapter",
     "ModelAdapterRouter",
@@ -565,6 +571,7 @@ async def generate_json(
     max_repairs: int = 2,
     recorder: ModelInvocationRecorder | None = None,
     before_call: Callable[[], Awaitable[None]] | None = None,
+    fault_injector: FaultInjector | None = None,
 ) -> tuple[dict[str, Any], list[ModelResponse]]:
     """Generate schema-valid JSON, repairing at most ``max_repairs`` times.
 
@@ -575,6 +582,7 @@ async def generate_json(
     ``before_call`` is awaited before every physical call (including repair
     turns) so the Runtime can stop issuing calls after cancellation.
     """
+    injector = fault_injector or NOOP_FAULT_INJECTOR
     prefix = str(request.metadata.get("invocation_key_prefix", "model"))
     current = request
     responses: list[ModelResponse] = []
@@ -586,6 +594,10 @@ async def generate_json(
         invocation_key = f"{prefix}:{call_index}"
         if recorder is not None:
             await recorder.record_started(invocation_key, current)
+        await injector.checkpoint(
+            FaultPoint.MODEL_CALL_IN_FLIGHT,
+            {"invocation_key": invocation_key, "metadata": current.metadata},
+        )
         try:
             try:
                 async with asyncio.timeout(request.timeout_seconds):
@@ -634,6 +646,10 @@ async def generate_json(
 
             if recorder is not None:
                 await recorder.record_finished(invocation_key, response, None)
+            await injector.checkpoint(
+                FaultPoint.MODEL_RETURNED,
+                {"invocation_key": invocation_key, "metadata": current.metadata},
+            )
             return decoded, responses
         except ModelOutputError:
             raise
