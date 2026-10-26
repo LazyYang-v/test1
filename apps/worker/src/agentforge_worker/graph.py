@@ -503,7 +503,55 @@ class AnalysisGraph:
             ),
             "data_snapshot_id": evidence["data_snapshot_id"],
             "annotations": list(query_plan.get("annotations") or []),
+            "dimension_results": AnalysisGraph._dimension_result_summary(
+                query_plan.get("dimension_results"),
+                query_plan.get("dimensions"),
+            ),
         }
+
+    @staticmethod
+    def _dimension_result_summary(
+        value: Any, allowed_dimensions: Any
+    ) -> list[dict[str, Any]]:
+        """Pass bounded, normalized breakdowns to compose without raw query data."""
+        if not isinstance(value, list):
+            return []
+        registered = frozenset(
+            dimension
+            for dimension in (allowed_dimensions or [])
+            if isinstance(dimension, str)
+        )
+        summary: list[dict[str, Any]] = []
+        for result in value[:100]:
+            if not isinstance(result, dict):
+                continue
+            raw_dimensions = result.get("dimensions")
+            if not isinstance(raw_dimensions, dict):
+                continue
+            dimensions = {
+                key: dimension_value[:128]
+                for key, dimension_value in raw_dimensions.items()
+                if key in registered
+                and isinstance(dimension_value, str)
+                and len(dimension_value) <= 128
+            }
+            row: dict[str, Any] = {"dimensions": dimensions}
+            for key in (
+                "current_value", "previous_value", "absolute_change", "change_rate"
+            ):
+                metric_value = result.get(key)
+                if metric_value is None or isinstance(metric_value, str):
+                    row[key] = metric_value
+            row_count = result.get("row_count")
+            if isinstance(row_count, int) and not isinstance(row_count, bool):
+                row["row_count"] = row_count
+            annotations = result.get("annotations")
+            if isinstance(annotations, list):
+                row["annotations"] = [
+                    item[:64] for item in annotations[:8] if isinstance(item, str)
+                ]
+            summary.append(row)
+        return summary
 
     @staticmethod
     def _to_evidence(evidence: dict[str, Any]) -> Evidence:

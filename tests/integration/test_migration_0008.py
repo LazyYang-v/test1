@@ -117,7 +117,7 @@ async def _seed_task(migrated_db) -> None:
         await conn.close()
 
 
-async def test_migration_0008_tables_columns_and_version(migrated_db):
+async def test_migrations_through_0010_tables_columns_and_version(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         for schema, tables in NEW_TABLES.items():
@@ -134,7 +134,47 @@ async def test_migration_0008_tables_columns_and_version(migrated_db):
         version = await conn.fetchval(
             "SELECT MAX(version) FROM agentforge.schema_migrations"
         )
-        assert version == 8
+        assert version == 10
+        privileges = await conn.fetchrow(
+            """
+            SELECT
+                has_table_privilege('agentforge_business_ro',
+                                    'business.metric_definitions', 'SELECT') AS business_table_select,
+                has_any_column_privilege('agentforge_business_ro',
+                                         'business.metric_definitions', 'SELECT') AS business_column_select,
+                has_table_privilege('agentforge_worker',
+                                    'business.metric_definitions', 'SELECT') AS worker_select,
+                has_table_privilege('agentforge_api',
+                                    'business.metric_definitions', 'SELECT') AS api_select,
+                has_table_privilege('agentforge_business_ro',
+                                    'business.metric_definitions', 'INSERT') AS business_insert,
+                has_table_privilege('agentforge_business_ro',
+                                    'business.metric_definitions', 'UPDATE') AS business_update,
+                has_table_privilege('agentforge_business_ro',
+                                    'business.metric_definitions', 'DELETE') AS business_delete
+            """
+        )
+        assert dict(privileges) == {
+            "business_table_select": False,
+            "business_column_select": True,
+            "worker_select": False,
+            "api_select": False,
+            "business_insert": False,
+            "business_update": False,
+            "business_delete": False,
+        }
+        metadata_columns = await conn.fetch(
+            """
+            SELECT column_name FROM information_schema.column_privileges
+            WHERE grantee = 'agentforge_business_ro' AND table_schema = 'business'
+              AND table_name = 'metric_definitions' AND privilege_type = 'SELECT'
+            """
+        )
+        assert {row["column_name"] for row in metadata_columns} == {
+            "metric_key", "version", "source_view", "expression_key",
+            "allowed_dimensions", "allowed_filters", "aggregation", "unit",
+            "time_column", "status",
+        }
         seeded_tool = await conn.fetchrow(
             "SELECT tool_key, status, is_read_only FROM registry.tool_versions "
             "WHERE id = $1::uuid",

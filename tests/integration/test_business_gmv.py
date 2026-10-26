@@ -193,6 +193,10 @@ async def test_loaded_business_snapshot_is_immutable_and_business_ro_queries_fro
                 has_table_privilege(current_user, 'business.orders', 'SELECT') AS table_select,
                 has_table_privilege(current_user, 'business.orders', 'INSERT') AS table_insert,
                 has_table_privilege(current_user, 'business.order_items', 'UPDATE') AS items_update,
+                has_table_privilege(current_user, 'business.metric_definitions', 'SELECT') AS metrics_select,
+                has_any_column_privilege(current_user, 'business.metric_definitions', 'SELECT') AS metrics_column_select,
+                has_table_privilege(current_user, 'business.metric_definitions', 'INSERT') AS metrics_insert,
+                has_table_privilege(current_user, 'business.metric_definitions', 'UPDATE') AS metrics_update,
                 has_table_privilege(current_user, 'business.metric_definitions', 'DELETE') AS metrics_delete
             """
         )
@@ -202,8 +206,49 @@ async def test_loaded_business_snapshot_is_immutable_and_business_ro_queries_fro
             "table_select": False,
             "table_insert": False,
             "items_update": False,
+            "metrics_select": False,
+            "metrics_column_select": True,
+            "metrics_insert": False,
+            "metrics_update": False,
             "metrics_delete": False,
         }
+        metadata_columns = await business_ro.fetch(
+            """
+            SELECT column_name FROM information_schema.column_privileges
+            WHERE grantee = current_user AND table_schema = 'business'
+              AND table_name = 'metric_definitions' AND privilege_type = 'SELECT'
+            """
+        )
+        assert {row["column_name"] for row in metadata_columns} == {
+            "metric_key", "version", "source_view", "expression_key",
+            "allowed_dimensions", "allowed_filters", "aggregation", "unit",
+            "time_column", "status",
+        }
+
+        for denied_column in ("id", "name", "created_at"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await business_ro.fetchval(
+                    f"SELECT {denied_column} FROM business.metric_definitions LIMIT 1"
+                )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await business_ro.execute(
+                "UPDATE business.metric_definitions SET status = 'retired' WHERE false"
+            )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await business_ro.execute(
+                "DELETE FROM business.metric_definitions WHERE false"
+            )
+        worker = await asyncpg.connect(migrated_db["role_dsn"]("worker"))
+        api = await asyncpg.connect(migrated_db["role_dsn"]("api"))
+        try:
+            for role in (worker, api):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await role.fetch(
+                        "SELECT metric_key FROM business.metric_definitions LIMIT 1"
+                    )
+        finally:
+            await worker.close()
+            await api.close()
 
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await business_ro.fetch("SELECT * FROM business.orders LIMIT 1")
