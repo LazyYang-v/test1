@@ -1,37 +1,35 @@
-"""Worker loop: claim, heartbeat, run the graph, and commit fenced terminal state."""
+"""Worker loop: claim, heartbeat, run the graph, and commit fenced terminal state.
+
+Cancellation is cooperative. A watcher polls the Runtime state; when a cancel
+request (or deadline) is observed the graph is cancelled, no new model/tool
+call is issued, and the owning worker performs the fenced terminal transition.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import random
 from typing import Any
 
-from agentforge_harness.gateway import ToolError, ToolGateway
-from agentforge_harness.models import ModelOutputError, ModelTimeoutError
-from agentforge_harness.report import ReportValidationError
+from agentforge_harness.gateway import ToolGateway
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_runtime.store import RuntimeStore
 
 from agentforge_worker.config import WorkerSettings
+from agentforge_worker.errors import classify_error_code, is_retryable
 from agentforge_worker.executors import MetricsQueryExecutor
 from agentforge_worker.gateway_backend import PostgresToolGatewayBackend
-from agentforge_worker.graph import AnalysisGraph, UnsupportedGraphError
+from agentforge_worker.graph import AnalysisGraph
 
 logger = logging.getLogger("agentforge.worker")
 
 
 def classify_error(error: BaseException) -> str:
-    if isinstance(error, (ModelOutputError, ModelTimeoutError)):
-        return error.code
-    if isinstance(error, (ReportValidationError, ToolError, UnsupportedGraphError)):
-        return error.code
-    if isinstance(error, TaskNotRunningError):
-        return error.code
-    if isinstance(error, LeaseLostError):
-        return "LEASE_LOST"
-    return "INTERNAL_ERROR"
+    """Backwards-compatible name for the frozen classification table."""
+    return classify_error_code(error)
 
 
 class Worker:
@@ -55,7 +53,18 @@ class Worker:
     async def close(self) -> None:
         await self.store.close()
 
+    async def reconcile_once(self) -> dict[str, int]:
+        """Run the state-machine sweep; failures must not stop claiming."""
+        try:
+            return await self.store.reconcile()
+        except Exception:  # pragma: no cover - defensive loop guard
+            logger.exception("reconciliation sweep failed")
+            return {}
+
     async def run_once(self) -> bool:
+        # Materialize queued cancellations, expired deadlines, and lost leases
+        # before claiming so a cancelled Task is never started.
+        await self.reconcile_once()
         lease = await self.store.claim()
         if lease is None:
             return False
@@ -72,6 +81,8 @@ class Worker:
     async def run_attempt(self, lease: AttemptLease) -> None:
         stop = asyncio.Event()
         lease_lost = asyncio.Event()
+        cancel_seen = asyncio.Event()
+        deadline_seen = asyncio.Event()
 
         async def heartbeat_loop() -> None:
             while not stop.is_set():
@@ -93,17 +104,48 @@ class Worker:
                 except TimeoutError:
                     continue
 
+        async def watch_loop() -> None:
+            """Detect cancellation/deadline/lease loss while the graph runs."""
+            while not stop.is_set():
+                try:
+                    reason = await self.store.stop_reason(lease)
+                except Exception:
+                    logger.exception(
+                        "cancellation watch failed",
+                        extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                    )
+                    reason = None
+                if reason == "CANCELLED":
+                    cancel_seen.set()
+                    return
+                if reason == "DEADLINE_EXCEEDED":
+                    deadline_seen.set()
+                    return
+                if reason == "LEASE_LOST":
+                    lease_lost.set()
+                    return
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(),
+                        timeout=self.settings.cancel_poll_interval_seconds,
+                    )
+                except TimeoutError:
+                    continue
+
         heartbeat = asyncio.create_task(heartbeat_loop())
+        watcher = asyncio.create_task(watch_loop())
         graph_task = asyncio.create_task(self.graph.run(lease))
-        lost_task = asyncio.create_task(lease_lost.wait())
+        lease_lost_waiter = asyncio.create_task(lease_lost.wait())
+        cancel_waiter = asyncio.create_task(cancel_seen.wait())
+        deadline_waiter = asyncio.create_task(deadline_seen.wait())
         try:
-            done, _ = await asyncio.wait(
-                {graph_task, lost_task}, return_when=asyncio.FIRST_COMPLETED
+            await asyncio.wait(
+                {graph_task, lease_lost_waiter, cancel_waiter, deadline_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if lost_task in done and not graph_task.done():
-                graph_task.cancel()
-                with contextlib.suppress(BaseException):
-                    await graph_task
+
+            if lease_lost.is_set():
+                await self._stop_graph(graph_task)
                 await self.store.abandon_attempt(lease)
                 logger.warning(
                     "lease lost during execution",
@@ -115,12 +157,28 @@ class Worker:
                 )
                 return
 
+            if deadline_seen.is_set():
+                await self._stop_graph(graph_task)
+                await self._expire(lease)
+                return
+
+            if cancel_seen.is_set():
+                await self._stop_graph(graph_task)
+                await self._cancel(lease)
+                return
+
             try:
                 report = graph_task.result()
             except asyncio.CancelledError:
                 raise
+            except LeaseLostError:
+                await self.store.abandon_attempt(lease)
+                return
+            except TaskNotRunningError as error:
+                await self._handle_refusal(lease, error)
+                return
             except BaseException as error:
-                await self._fail(lease, error)
+                await self._handle_failure(lease, error)
                 return
 
             try:
@@ -128,32 +186,109 @@ class Worker:
             except LeaseLostError:
                 await self.store.abandon_attempt(lease)
             except TaskNotRunningError as error:
-                logger.warning(
-                    "task left running before completion",
-                    extra={"task_id": lease.task_id, "error_code": error.code},
-                )
+                # Cancellation or deadline won the terminal race.
+                await self._handle_refusal(lease, error)
         finally:
             stop.set()
-            lost_task.cancel()
+            for task in (
+                lease_lost_waiter,
+                cancel_waiter,
+                deadline_waiter,
+                watcher,
+                heartbeat,
+            ):
+                task.cancel()
             if not graph_task.done():
                 graph_task.cancel()
-            await asyncio.gather(heartbeat, lost_task, graph_task, return_exceptions=True)
+            await asyncio.gather(
+                heartbeat,
+                watcher,
+                lease_lost_waiter,
+                cancel_waiter,
+                deadline_waiter,
+                graph_task,
+                return_exceptions=True,
+            )
 
-    async def _fail(self, lease: AttemptLease, error: BaseException) -> None:
-        code = classify_error(error)
+    @staticmethod
+    async def _stop_graph(graph_task: asyncio.Task) -> None:
+        if not graph_task.done():
+            graph_task.cancel()
+        with contextlib.suppress(BaseException):
+            await graph_task
+
+    async def _cancel(self, lease: AttemptLease) -> None:
+        try:
+            await self.store.mark_cancelling(lease)
+        except LeaseLostError:
+            await self.store.abandon_attempt(lease)
+            return
+        try:
+            await self.store.finalize_cancellation(lease)
+        except LeaseLostError:
+            await self.store.abandon_attempt(lease)
+
+    async def _expire(self, lease: AttemptLease) -> None:
+        try:
+            await self.store.expire_task(lease)
+        except LeaseLostError:
+            await self.store.abandon_attempt(lease)
+
+    async def _handle_refusal(
+        self, lease: AttemptLease, error: TaskNotRunningError
+    ) -> None:
+        if error.code == "CANCELLED":
+            await self._cancel(lease)
+        elif error.code == "DEADLINE_EXCEEDED":
+            await self._expire(lease)
+        else:
+            await self.store.abandon_attempt(lease, error_code=error.code)
+
+    def _retry_delay(self) -> float:
+        return self.settings.retry_base_delay_seconds + random.uniform(
+            0, self.settings.retry_jitter_seconds
+        )
+
+    async def _handle_failure(
+        self, lease: AttemptLease, error: BaseException
+    ) -> None:
+        code = classify_error_code(error)
         logger.info(
             "attempt failed",
             extra={
                 "task_id": lease.task_id,
                 "attempt_id": lease.attempt_id,
                 "error_code": code,
+                "retryable": is_retryable(code),
             },
         )
+        if isinstance(error, LeaseLostError):
+            await self.store.abandon_attempt(lease, error_code=code)
+            return
+        if isinstance(error, TaskNotRunningError):
+            await self._handle_refusal(lease, error)
+            return
         try:
-            await self.store.fail_task(lease, code, str(error))
+            if is_retryable(code):
+                outcome = await self.store.retry_task(
+                    lease,
+                    code,
+                    str(error),
+                    delay_seconds=self._retry_delay(),
+                )
+                logger.info(
+                    "retryable failure handled",
+                    extra={
+                        "task_id": lease.task_id,
+                        "attempt_id": lease.attempt_id,
+                        "error_code": code,
+                        "outcome": outcome,
+                    },
+                )
+            else:
+                await self.store.fail_task(lease, code, str(error))
         except LeaseLostError:
             await self.store.abandon_attempt(lease, error_code=code)
-        except TaskNotRunningError:
-            # Cancellation/deadline/terminal state is owned by the runtime state
-            # machine (tickets 08-09); this attempt cannot write a terminal state.
-            return
+        except TaskNotRunningError as error:
+            # Cancellation/deadline/terminal state owns the Task.
+            await self._handle_refusal(lease, error)

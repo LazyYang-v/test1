@@ -195,6 +195,10 @@ class ToolGatewayBackend(Protocol):
 
     async def lease_is_valid(self, context: ToolContext) -> bool: ...
 
+    async def stop_reason(self, context: ToolContext) -> str | None:
+        """Return LEASE_LOST / CANCELLED / DEADLINE_EXCEEDED, else None."""
+        ...
+
     async def accepted_call_count(self, task_id: str, tool_version_id: str) -> int: ...
 
     async def find_invocation(
@@ -233,6 +237,17 @@ class ToolGateway:
     ) -> None:
         self._backend = backend
         self._executors = dict(executors)
+
+    async def _stop_reason(self, context: ToolContext) -> str | None:
+        """Make cancellation/deadline/lease loss explicit at both boundaries."""
+        checker = getattr(self._backend, "stop_reason", None)
+        if checker is not None:
+            reason = await checker(context)
+            if reason is not None:
+                return reason
+        if not await self._backend.lease_is_valid(context):
+            return "LEASE_LOST"
+        return None
 
     async def invoke(
         self,
@@ -339,8 +354,9 @@ class ToolGateway:
                 await reject("BUDGET_EXCEEDED", "tool call budget is exhausted", descriptor)
 
         # 5. Lease and cancellation state, checked before any work and again at acceptance.
-        if not await self._backend.lease_is_valid(context):
-            await reject("LEASE_LOST", "the attempt lease is no longer valid", descriptor)
+        reason = await self._stop_reason(context)
+        if reason is not None:
+            await reject(reason, "the attempt can no longer execute", descriptor)
 
         # 6. Stable ToolInvocation reuse (read-only retries are safe).
         if previous is not None:
@@ -395,6 +411,12 @@ class ToolGateway:
                 "tool result is not bound to the task data snapshot",
                 descriptor,
             )
+
+        # Re-check after execution: a cancellation that arrived while the
+        # read-only executor ran must prevent the result from being accepted.
+        reason = await self._stop_reason(context)
+        if reason is not None:
+            await reject(reason, "the attempt stopped before result acceptance", descriptor)
 
         # 9. Persist acceptance plus audit/trace in a fenced short transaction.
         accepted = await self._backend.accept(

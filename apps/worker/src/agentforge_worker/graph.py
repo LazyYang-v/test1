@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -157,6 +158,8 @@ class AnalysisGraph:
         max_output_tokens = agent.get("max_output_tokens")
 
         async def plan_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
+
             async def work() -> dict[str, Any]:
                 request = ModelRequest(
                     messages=self._plan_messages(task),
@@ -181,6 +184,7 @@ class AnalysisGraph:
                     PLAN_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
+                    before_call=lambda: self._require_live(lease),
                 )
                 return content
 
@@ -195,6 +199,7 @@ class AnalysisGraph:
             }
 
         async def execute_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             plan = state["plan"]
 
             async def work() -> dict[str, Any]:
@@ -231,6 +236,7 @@ class AnalysisGraph:
             }
 
         async def compose_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             evidences = await self._store.load_evidences(task["task_id"])
             summaries = [self._evidence_summary(evidence) for evidence in evidences]
             evidence_ids = [evidence["evidence_id"] for evidence in evidences]
@@ -261,6 +267,7 @@ class AnalysisGraph:
                     COMPOSE_SCHEMA,
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
+                    before_call=lambda: self._require_live(lease),
                 )
                 return content
 
@@ -275,6 +282,7 @@ class AnalysisGraph:
             }
 
         async def validate_node(state: AnalysisState) -> dict[str, Any]:
+            await self._require_live(lease)
             compose = state["compose"]
 
             async def work() -> dict[str, Any]:
@@ -331,6 +339,22 @@ class AnalysisGraph:
         )
         return final_state["report"]
 
+    async def _require_live(self, lease: AttemptLease) -> None:
+        """Node-boundary guard: stop before any new model/tool call."""
+        reason = await self._store.stop_reason(lease)
+        if reason == "DEADLINE_EXCEEDED":
+            raise TaskNotRunningError(
+                "DEADLINE_EXCEEDED", "task deadline has passed"
+            )
+        if reason == "CANCELLED":
+            raise TaskNotRunningError(
+                "CANCELLED", "task cancellation was requested"
+            )
+        if reason == "LEASE_LOST":
+            raise LeaseLostError(
+                "attempt lease, identity, or fencing epoch is stale"
+            )
+
     async def _step(
         self,
         lease: AttemptLease,
@@ -345,6 +369,9 @@ class AnalysisGraph:
             return confirmed.result
         try:
             result = await work()
+        except asyncio.CancelledError:
+            # Cooperative cancellation must not be converted into a failed step.
+            raise
         except BaseException as error:
             try:
                 await self._store.fail_step(
