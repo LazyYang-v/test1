@@ -106,6 +106,22 @@ def _config_hash(
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    if type(left) in (int, float) and type(right) in (int, float):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _json_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_equal(value, other) for value, other in zip(left, right)
+        )
+    return left == right
+
+
 def _policy_override_only_tightens(
     base_policy: Mapping[str, Any], policy_override: Mapping[str, Any]
 ) -> bool:
@@ -114,14 +130,17 @@ def _policy_override_only_tightens(
     for key, value in policy_override.items():
         base_value = base_policy.get(key)
         if key.startswith("max_"):
-            if not isinstance(base_value, (int, float)) or not isinstance(value, (int, float)):
+            if type(base_value) not in (int, float) or type(value) not in (int, float):
                 return False
             if value > base_value:
                 return False
         elif key.startswith("allowed_"):
             if not isinstance(base_value, list) or not isinstance(value, list):
                 return False
-            if any(candidate not in base_value for candidate in value):
+            if any(
+                not any(_json_equal(candidate, permitted) for permitted in base_value)
+                for candidate in value
+            ):
                 return False
         elif key.startswith("require_"):
             if not isinstance(base_value, bool) or value is not True:

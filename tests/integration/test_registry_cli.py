@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -12,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import asyncpg
 import pytest
+
+from agentforge_core.migrations import apply_migrations
 
 
 pytestmark = pytest.mark.integration
@@ -87,6 +90,30 @@ def _draft(migrated_db, profile_key: str, *, agent_key: str = "sales-report") ->
     )
 
 
+def _tool(migrated_db, policy: dict, *, tool_key: str = "policy-tool") -> dict:
+    return _result(
+        _cli(
+            migrated_db,
+            "tool",
+            "register",
+            "--tool-key",
+            tool_key,
+            "--version",
+            "1",
+            "--input-schema-json",
+            '{"type":"object"}',
+            "--output-schema-json",
+            '{"type":"object"}',
+            "--policy-json",
+            json.dumps(policy),
+            "--execution-kind",
+            "internal",
+            "--timeout-ms",
+            "1000",
+        )
+    )
+
+
 def _publish(migrated_db, version_id: str) -> dict:
     return _result(
         _cli(
@@ -101,11 +128,11 @@ def _publish(migrated_db, version_id: str) -> dict:
     )
 
 
-async def test_registry_migration_is_present_in_schema_version_six(migrated_db):
+async def test_registry_migration_is_present_in_schema_version_seven(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         registry_migration_applied = await conn.fetchval(
-            "SELECT EXISTS (SELECT FROM agentforge.schema_migrations WHERE version = 4)"
+            "SELECT count(*) = 2 FROM agentforge.schema_migrations WHERE version IN (4, 7)"
         )
         registry_tables = await conn.fetch(
             """
@@ -181,6 +208,45 @@ async def test_registry_migration_is_present_in_schema_version_six(migrated_db):
                 "SELECT has_table_privilege(current_user, $1, 'SELECT,INSERT,UPDATE,DELETE')",
                 table,
             ) is True
+    finally:
+        await conn.close()
+
+
+async def test_registry_helpers_are_restricted_to_trusted_trigger_execution(migrated_db):
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
+    try:
+        helpers = await conn.fetch(
+            """
+            SELECT proc.oid::regprocedure::text AS signature, proc.prosecdef, proc.proconfig,
+                   NOT EXISTS (
+                       SELECT FROM aclexplode(COALESCE(proc.proacl, acldefault('f', proc.proowner))) AS acl
+                       WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE'
+                   ) AS no_public_execute
+            FROM pg_proc AS proc
+            JOIN pg_namespace AS namespace ON namespace.oid = proc.pronamespace
+            WHERE namespace.nspname = 'registry'
+            """
+        )
+        assert helpers
+        for helper in helpers:
+            assert helper["prosecdef"] is True, helper["signature"]
+            assert helper["proconfig"] in (
+                ["search_path=pg_catalog, registry"],
+                ["search_path=pg_catalog, registry, audit"],
+            ), helper["signature"]
+            assert helper["no_public_execute"] is True, helper["signature"]
+        for role in ("registry_cli", "api", "worker", "business_ro", "eval"):
+            assert await conn.fetchval(
+                """
+                SELECT NOT EXISTS (
+                    SELECT FROM pg_proc AS proc
+                    JOIN pg_namespace AS namespace ON namespace.oid = proc.pronamespace
+                    WHERE namespace.nspname = 'registry'
+                      AND has_function_privilege($1, proc.oid, 'EXECUTE')
+                )
+                """,
+                f"agentforge_{role}",
+            ) is True, role
     finally:
         await conn.close()
 
@@ -373,6 +439,410 @@ async def test_tool_policy_override_may_only_tighten_and_published_bindings_free
                 draft["id"],
                 tool["id"],
             )
+    finally:
+        await conn.close()
+
+
+INVALID_POLICY_OVERRIDES = [
+    pytest.param({}, {"max_calls": 4}, id="missing-max"),
+    pytest.param({}, {"allowed_regions": ["east"]}, id="missing-allowed"),
+    pytest.param({}, {"allowed_regions": []}, id="missing-allowed-empty"),
+    pytest.param({}, {"require_approval": False}, id="missing-require"),
+    pytest.param({}, {"allow_export": True}, id="missing-allow"),
+    pytest.param(
+        {"allowed_routes": [{"region": "east", "mode": "read"}]},
+        {"allowed_routes": [{"region": "east"}]},
+        id="partial-object",
+    ),
+    pytest.param(
+        {"allowed_routes": [["east", "west"]]},
+        {"allowed_routes": [["east"]]},
+        id="nested-array-subset",
+    ),
+    pytest.param(
+        {"allowed_routes": [["east", "west"]]},
+        {"allowed_routes": [["west", "east"]]},
+        id="nested-array-reordered",
+    ),
+    pytest.param({"max_calls": None}, {"max_calls": 4}, id="null-base-max"),
+    pytest.param({"allowed_regions": None}, {"allowed_regions": []}, id="null-base-allowed"),
+    pytest.param({"require_approval": None}, {"require_approval": True}, id="null-base-require"),
+    pytest.param({"allow_export": None}, {"allow_export": False}, id="null-base-allow"),
+    pytest.param({"max_calls": 5}, {"max_calls": None}, id="null-override-max"),
+    pytest.param({"allowed_regions": []}, {"allowed_regions": None}, id="null-override-allowed"),
+    pytest.param({"require_approval": False}, {"require_approval": None}, id="null-override-require"),
+    pytest.param({"allow_export": True}, {"allow_export": None}, id="null-override-allow"),
+    pytest.param({"max_calls": True}, {"max_calls": 1}, id="boolean-base-limit"),
+    pytest.param({"max_calls": 5}, {"max_calls": True}, id="boolean-override-limit"),
+    pytest.param({"max_calls": 5}, {"max_calls": "3"}, id="string-override-limit"),
+    pytest.param({"max_calls": "5"}, {"max_calls": 3}, id="string-base-limit"),
+    pytest.param({"max_calls": 5}, {"max_calls": 6}, id="larger-limit"),
+    pytest.param({"allowed_values": [True]}, {"allowed_values": [1]}, id="boolean-member"),
+    pytest.param({"allowed_values": [1]}, {"allowed_values": [True]}, id="numeric-member"),
+    pytest.param(
+        {"allowed_values": [{"enabled": True}]},
+        {"allowed_values": [{"enabled": 1}]},
+        id="nested-boolean-member",
+    ),
+    pytest.param(
+        {"allowed_values": [[False]]}, {"allowed_values": [[0]]}, id="nested-numeric-member"
+    ),
+    pytest.param({"allowed_values": [None]}, {"allowed_values": [False]}, id="null-member"),
+    pytest.param({"allowed_regions": "east"}, {"allowed_regions": []}, id="string-base-allowed"),
+    pytest.param({"allowed_regions": []}, {"allowed_regions": {}}, id="object-override-allowed"),
+    pytest.param({"require_approval": 1}, {"require_approval": True}, id="numeric-base-require"),
+    pytest.param({"require_approval": False}, {"require_approval": 1}, id="numeric-override-require"),
+    pytest.param({"require_approval": False}, {"require_approval": False}, id="require-not-enabled"),
+    pytest.param({"allow_export": 0}, {"allow_export": False}, id="numeric-base-allow"),
+    pytest.param({"allow_export": True}, {"allow_export": 0}, id="numeric-override-allow"),
+    pytest.param({"allow_export": False}, {"allow_export": True}, id="allow-enabled"),
+    pytest.param({"timeout": 5}, {"timeout": 3}, id="unknown-prefix"),
+]
+
+
+VALID_POLICY_OVERRIDES = [
+    pytest.param({}, {}, id="empty-override"),
+    pytest.param({"max_calls": 5}, {"max_calls": 3}, id="smaller-limit"),
+    pytest.param({"max_calls": 5}, {"max_calls": 5.0}, id="equal-numeric-limit"),
+    pytest.param({"allowed_regions": ["east", "west"]}, {"allowed_regions": ["west"]}, id="subset"),
+    pytest.param({"allowed_regions": ["east"]}, {"allowed_regions": []}, id="empty-subset"),
+    pytest.param({"allowed_regions": []}, {"allowed_regions": []}, id="empty-base-array"),
+    pytest.param(
+        {"allowed_routes": [{"region": "east", "mode": "read"}]},
+        {"allowed_routes": [{"mode": "read", "region": "east"}]},
+        id="exact-object",
+    ),
+    pytest.param(
+        {"allowed_routes": [["east", "west"]]},
+        {"allowed_routes": [["east", "west"]]},
+        id="ordered-nested-array",
+    ),
+    pytest.param(
+        {"allowed_values": [{"items": [None, True, 1]}]},
+        {"allowed_values": [{"items": [None, True, 1.0]}]},
+        id="nested-json-types",
+    ),
+    pytest.param({"allowed_values": [True]}, {"allowed_values": [True]}, id="boolean-member"),
+    pytest.param({"allowed_values": [1]}, {"allowed_values": [1.0]}, id="equal-numeric-member"),
+    pytest.param({"allowed_values": [None]}, {"allowed_values": [None]}, id="null-member"),
+    pytest.param({"require_approval": False}, {"require_approval": True}, id="require-enabled"),
+    pytest.param({"require_approval": True}, {"require_approval": True}, id="require-retained"),
+    pytest.param({"allow_export": True}, {"allow_export": False}, id="allow-disabled"),
+    pytest.param({"allow_export": True}, {"allow_export": True}, id="allow-retained"),
+    pytest.param({"allow_export": False}, {"allow_export": False}, id="disallow-retained"),
+]
+
+
+@pytest.mark.parametrize("base_policy,override", VALID_POLICY_OVERRIDES)
+def test_valid_policy_override_can_be_bound_validated_and_published(
+    migrated_db, base_policy, override
+):
+    _profile(migrated_db, "valid-policy")
+    draft = _draft(migrated_db, "valid-policy")
+    tool = _tool(migrated_db, base_policy)
+    binding = _result(
+        _cli(
+            migrated_db,
+            "agent",
+            "bind-tool",
+            "--version-id",
+            draft["id"],
+            "--tool-id",
+            tool["id"],
+            "--policy-override-json",
+            json.dumps(override),
+        )
+    )
+    assert binding["policy_override"] == override
+    assert _result(_cli(migrated_db, "agent", "validate", "--version-id", draft["id"]))["valid"] is True
+    assert _publish(migrated_db, draft["id"])["status"] == "published"
+
+
+@pytest.mark.parametrize("base_policy,override", INVALID_POLICY_OVERRIDES)
+@pytest.mark.parametrize("operation", ["insert", "update"])
+async def test_external_binding_rejects_invalid_policy_override(
+    migrated_db, base_policy, override, operation
+):
+    _profile(migrated_db, "invalid-policy")
+    draft = _draft(migrated_db, "invalid-policy")
+    tool = _tool(migrated_db, base_policy)
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    try:
+        if operation == "update":
+            await conn.execute(
+                "INSERT INTO registry.agent_tool_bindings (agent_version_id, tool_version_id) "
+                "VALUES ($1::uuid, $2::uuid)",
+                draft["id"],
+                tool["id"],
+            )
+            statement = (
+                "UPDATE registry.agent_tool_bindings SET policy_override = $3::jsonb "
+                "WHERE agent_version_id = $1::uuid AND tool_version_id = $2::uuid"
+            )
+        else:
+            statement = (
+                "INSERT INTO registry.agent_tool_bindings "
+                "(agent_version_id, tool_version_id, policy_override) "
+                "VALUES ($1::uuid, $2::uuid, $3::jsonb)"
+            )
+        with pytest.raises(asyncpg.CheckViolationError, match="only tighten"):
+            await conn.execute(statement, draft["id"], tool["id"], json.dumps(override))
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("base_policy,override", INVALID_POLICY_OVERRIDES)
+def test_cli_binding_rejects_invalid_policy_override(migrated_db, base_policy, override):
+    _profile(migrated_db, "cli-invalid-policy")
+    draft = _draft(migrated_db, "cli-invalid-policy")
+    tool = _tool(migrated_db, base_policy)
+    rejected = _cli(
+        migrated_db,
+        "agent",
+        "bind-tool",
+        "--version-id",
+        draft["id"],
+        "--tool-id",
+        tool["id"],
+        "--policy-override-json",
+        json.dumps(override),
+        check=False,
+    )
+    assert rejected.returncode == 1
+    assert "only tighten" in rejected.stderr
+
+
+async def _legacy_binding(migrated_db, draft: dict, tool: dict, override: dict) -> None:
+    """Reproduce a pre-repair binding without granting the CLI trigger privileges."""
+    conn = await asyncpg.connect(migrated_db["superuser_dsn"])
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "ALTER TABLE registry.agent_tool_bindings DISABLE TRIGGER agent_tool_bindings_guard"
+            )
+            await conn.execute(
+                "INSERT INTO registry.agent_tool_bindings "
+                "(agent_version_id, tool_version_id, policy_override) "
+                "VALUES ($1::uuid, $2::uuid, $3::jsonb)",
+                draft["id"],
+                tool["id"],
+                json.dumps(override),
+            )
+            await conn.execute(
+                "ALTER TABLE registry.agent_tool_bindings ENABLE TRIGGER agent_tool_bindings_guard"
+            )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("base_policy,override", INVALID_POLICY_OVERRIDES)
+@pytest.mark.parametrize("command", ["validate", "publish"])
+async def test_cli_rejects_legacy_invalid_policy_override(
+    migrated_db, base_policy, override, command
+):
+    _profile(migrated_db, "legacy-policy")
+    draft = _draft(migrated_db, "legacy-policy")
+    tool = _tool(migrated_db, base_policy)
+    await _legacy_binding(migrated_db, draft, tool, override)
+
+    args = ["agent", command, "--version-id", draft["id"]]
+    if command == "publish":
+        args.extend(["--actor-id", ACTOR_ID])
+    rejected = _cli(migrated_db, *args, check=False)
+    assert rejected.returncode == 1
+    if command == "validate":
+        assert _result(rejected)["valid"] is False
+        assert "loosens policy" in " ".join(_result(rejected)["errors"])
+    else:
+        assert "loosens policy" in rejected.stderr
+    assert _result(_cli(migrated_db, "agent", "show", "--version-id", draft["id"]))["status"] == "draft"
+
+
+@pytest.mark.parametrize(
+    "base_policy,override",
+    [
+        pytest.param({}, {"max_calls": 4}, id="missing-base"),
+        pytest.param(
+            {"allowed_routes": [{"region": "east", "mode": "read"}]},
+            {"allowed_routes": [{"region": "east"}]},
+            id="partial-object",
+        ),
+    ],
+)
+async def test_external_publication_rejects_legacy_invalid_policy_binding(
+    migrated_db, base_policy, override
+):
+    _profile(migrated_db, "legacy-publish")
+    draft = _draft(migrated_db, "legacy-publish")
+    tool = _tool(migrated_db, base_policy)
+    await _legacy_binding(migrated_db, draft, tool, override)
+
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    try:
+        with pytest.raises(asyncpg.CheckViolationError, match="only tighten"):
+            await conn.execute(
+                "UPDATE registry.agent_versions SET status = 'published', "
+                "model_config_snapshot = '{\"provider\":\"fake\"}'::jsonb, published_at = now() "
+                "WHERE id = $1::uuid",
+                draft["id"],
+            )
+    finally:
+        await conn.close()
+    assert _result(_cli(migrated_db, "agent", "show", "--version-id", draft["id"]))["status"] == "draft"
+
+
+@pytest.mark.parametrize("status", ["draft", "published", "retired"])
+@pytest.mark.parametrize("case", ["missing-base", "partial-object"])
+async def test_policy_migration_rejects_existing_invalid_bindings_without_changing_them(
+    migrated_db, unmigrated_db, tmp_path, status, case
+):
+    versions = migrated_db["repo_root"] / "migrations" / "versions"
+    for source in versions.glob("*.sql"):
+        if int(source.name[:4]) < 7:
+            shutil.copyfile(source, tmp_path / source.name)
+    dsn = unmigrated_db["role_dsn"]("migrator")
+    await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
+    legacy_db = {**migrated_db, **unmigrated_db}
+    _profile(legacy_db, "upgrade-profile")
+    draft = _draft(legacy_db, "upgrade-profile")
+    if case == "missing-base":
+        tool = _tool(legacy_db, {})
+        override = {"max_calls": 4}
+    else:
+        tool = _tool(legacy_db, {"allowed_routes": [{"region": "east", "mode": "read"}]})
+        override = {"allowed_routes": [{"region": "east"}]}
+
+    conn = await asyncpg.connect(legacy_db["role_dsn"]("registry_cli"))
+    try:
+        await conn.execute(
+            "INSERT INTO registry.agent_tool_bindings "
+            "(agent_version_id, tool_version_id, policy_override) "
+            "VALUES ($1::uuid, $2::uuid, $3::jsonb)",
+            draft["id"],
+            tool["id"],
+            json.dumps(override),
+        )
+        if status != "draft":
+            await conn.execute(
+                "UPDATE registry.agent_versions SET status = 'published', "
+                "model_config_snapshot = '{\"provider\":\"fake\"}'::jsonb, published_at = now() "
+                "WHERE id = $1::uuid",
+                draft["id"],
+            )
+        if status == "retired":
+            await conn.execute(
+                "UPDATE registry.agent_versions SET status = 'retired' WHERE id = $1::uuid",
+                draft["id"],
+            )
+        before = await conn.fetchrow(
+            "SELECT row_to_json(agent)::text AS agent, row_to_json(binding)::text AS binding "
+            "FROM registry.agent_versions AS agent "
+            "JOIN registry.agent_tool_bindings AS binding ON binding.agent_version_id = agent.id "
+            "WHERE agent.id = $1::uuid",
+            draft["id"],
+        )
+    finally:
+        await conn.close()
+
+    migration = versions / "0007_registry_policy_validation.sql"
+    shutil.copyfile(migration, tmp_path / migration.name)
+    with pytest.raises(asyncpg.CheckViolationError, match="existing invalid Registry policy override") as error:
+        await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
+    assert draft["id"] in str(error.value)
+    assert tool["id"] in str(error.value)
+    assert status in str(error.value)
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        assert await conn.fetchval(
+            "SELECT EXISTS (SELECT FROM agentforge.schema_migrations WHERE version = 7)"
+        ) is False
+        after = await conn.fetchrow(
+            "SELECT row_to_json(agent)::text AS agent, row_to_json(binding)::text AS binding "
+            "FROM registry.agent_versions AS agent "
+            "JOIN registry.agent_tool_bindings AS binding ON binding.agent_version_id = agent.id "
+            "WHERE agent.id = $1::uuid",
+            draft["id"],
+        )
+        assert after == before
+    finally:
+        await conn.close()
+
+
+async def test_policy_migration_preserves_valid_published_bindings(
+    migrated_db, unmigrated_db, tmp_path
+):
+    versions = migrated_db["repo_root"] / "migrations" / "versions"
+    for source in versions.glob("*.sql"):
+        if int(source.name[:4]) < 7:
+            shutil.copyfile(source, tmp_path / source.name)
+    dsn = unmigrated_db["role_dsn"]("migrator")
+    await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
+    legacy_db = {**migrated_db, **unmigrated_db}
+    _profile(legacy_db, "valid-upgrade")
+    draft = _draft(legacy_db, "valid-upgrade")
+    tool = _tool(legacy_db, {"max_calls": 5, "allowed_routes": [{"region": "east", "mode": "read"}]})
+    _cli(
+        legacy_db,
+        "agent",
+        "bind-tool",
+        "--version-id",
+        draft["id"],
+        "--tool-id",
+        tool["id"],
+        "--policy-override-json",
+        '{"max_calls":3,"allowed_routes":[{"region":"east","mode":"read"}]}',
+    )
+    before = _publish(legacy_db, draft["id"])
+    migration = versions / "0007_registry_policy_validation.sql"
+    shutil.copyfile(migration, tmp_path / migration.name)
+    await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
+
+    after = _result(_cli(legacy_db, "agent", "show", "--version-id", draft["id"]))
+    assert after["status"] == "published"
+    assert after["config_hash"] == before["config_hash"]
+    assert after["model_config_snapshot"] == before["model_config_snapshot"]
+    assert after["published_at"] == before["published_at"]
+    conn = await asyncpg.connect(legacy_db["role_dsn"]("registry_cli"))
+    try:
+        policy = await conn.fetchval(
+            "SELECT policy_override FROM registry.agent_tool_bindings "
+            "WHERE agent_version_id = $1::uuid AND tool_version_id = $2::uuid",
+            draft["id"],
+            tool["id"],
+        )
+        assert json.loads(policy) == {
+            "max_calls": 3,
+            "allowed_routes": [{"region": "east", "mode": "read"}],
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("resource", ["agent", "tool"])
+async def test_external_registry_version_identifier_is_immutable(migrated_db, resource):
+    if resource == "agent":
+        _profile(migrated_db, "identity-profile")
+        version = _draft(migrated_db, "identity-profile")
+        _publish(migrated_db, version["id"])
+        table = "agent_versions"
+        update = "id = $2::uuid, status = 'retired'"
+    else:
+        version = _tool(migrated_db, {})
+        table = "tool_versions"
+        update = "id = $2::uuid"
+
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    try:
+        with pytest.raises(asyncpg.CheckViolationError, match="identifiers are immutable"):
+            await conn.execute(
+                f"UPDATE registry.{table} SET {update} WHERE id = $1::uuid",
+                version["id"],
+                str(uuid.uuid4()),
+            )
+        assert await conn.fetchval(
+            f"SELECT id::text FROM registry.{table} WHERE id = $1::uuid", version["id"]
+        ) == version["id"]
     finally:
         await conn.close()
 
