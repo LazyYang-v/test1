@@ -9,3 +9,4 @@ apps/web/tsconfig.tsbuildinfo
 .claude/
 dist/
 .env
+.pi/
