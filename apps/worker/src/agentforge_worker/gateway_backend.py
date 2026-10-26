@@ -275,6 +275,7 @@ class PostgresToolGatewayBackend:
                     existing = await conn.fetchrow(
                         """
                         SELECT invocation.id::text AS id,
+                               invocation.result_json,
                                evidence.id::text AS evidence_id
                         FROM harness.tool_invocations AS invocation
                         LEFT JOIN harness.evidences AS evidence
@@ -286,7 +287,11 @@ class PostgresToolGatewayBackend:
                         invocation_key,
                     )
                     return {
-                        "result": result,
+                        "result": (
+                            result
+                            if existing is None
+                            else _json_value(existing["result_json"])
+                        ),
                         "evidence_id": None if existing is None else existing["evidence_id"],
                         "reused": True,
                     }

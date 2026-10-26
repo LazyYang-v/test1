@@ -7,6 +7,8 @@ import logging
 import signal
 
 import asyncpg
+from agentforge_core.migrations import fetch_applied_version
+from agentforge_core.schema_version import SCHEMA_VERSION
 
 from agentforge_harness.models import FakeModel
 from agentforge_runtime.store import RuntimeStore
@@ -15,8 +17,21 @@ from agentforge_worker.config import WorkerSettings
 from agentforge_worker.worker import Worker
 
 
+async def _require_current_schema(dsn: str) -> None:
+    conn = await asyncpg.connect(dsn)
+    try:
+        applied = await fetch_applied_version(conn)
+    finally:
+        await conn.close()
+    if applied != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"worker requires schema version {SCHEMA_VERSION}, database has {applied}"
+        )
+
+
 async def _run() -> None:
     settings = WorkerSettings()
+    await _require_current_schema(settings.worker_db_dsn)
     pool = await asyncpg.create_pool(
         settings.worker_db_dsn,
         min_size=1,
