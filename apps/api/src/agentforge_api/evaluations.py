@@ -145,7 +145,7 @@ async def create_run(
                 SELECT id::text AS dataset_id, dataset_key, version, data_snapshot_id
                 FROM evaluation.datasets
                 WHERE dataset_key = $1 AND status = 'active'
-                ORDER BY version DESC LIMIT 1 FOR SHARE
+                ORDER BY version DESC LIMIT 1
                 """,
                 body.dataset_key,
             )
@@ -257,16 +257,16 @@ async def create_run(
                 await conn.execute(
                     """
                     INSERT INTO runtime.tasks
-                        (id, owner_user_id, agent_version_id, task_type, status,
+                        (id, trace_id, owner_user_id, agent_version_id, task_type, status,
                          input_json, input_hash, region_scope_json, authorization_snapshot,
-                         data_snapshot_id, max_attempts, deadline_at)
-                    VALUES ($1::uuid, $2::uuid, $3::uuid, 'business_analysis', 'queued',
+                         data_snapshot_id, max_attempts, deadline_at, eval_run_id)
+                    VALUES ($1::uuid, $1::text, $2::uuid, $3::uuid, 'business_analysis', 'queued',
                             $4::jsonb, $5, $6::jsonb, $7::jsonb, $8, 1,
-                            now() + interval '10 minutes')
+                            now() + interval '10 minutes', $9::uuid)
                     """,
                     task_id, svc_eval["id"], agent["agent_version_id"],
                     _canonical(normalized_input), task_input_hash,
-                    _canonical(regions), _canonical(region_grants), snapshot,
+                    _canonical(regions), _canonical(region_grants), snapshot, run_id,
                 )
                 await conn.execute(
                     """
@@ -326,11 +326,11 @@ async def create_run(
             await conn.execute(
                 """
                 UPDATE runtime.idempotency_records
-                SET status = 'completed', resource_id = $2::uuid,
-                    response_status = 202, response_json = $3::jsonb, updated_at = now()
+                SET status = 'completed', resource_id = NULL,
+                    response_status = 202, response_json = $2::jsonb, updated_at = now()
                 WHERE id = $1::uuid
                 """,
-                claimed, run_id, _canonical(response),
+                claimed, _canonical(response),
             )
     return JSONResponse(status_code=202, content=response)
 

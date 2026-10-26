@@ -63,7 +63,7 @@ async def _run_worker_once(db, model=None):
         model_timeout_seconds=10,
         max_model_repairs=2,
     )
-    worker = Worker(settings, store, model or FakeModel())
+    worker = Worker(settings, store, model or FakeModel(), fake_model=model or FakeModel())
     try:
         return await worker.run_once()
     finally:

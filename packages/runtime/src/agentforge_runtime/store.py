@@ -1660,10 +1660,11 @@ class RuntimeStore:
             await conn.execute(
                 """
                 UPDATE evaluation.runs
-                SET status = CASE WHEN $1 = $2 THEN 'completed' ELSE 'failed' END,
+                SET status = CASE WHEN $1::integer = $2::integer THEN 'completed' ELSE 'failed' END,
                     finished_at = now(),
                     summary_json = jsonb_build_object(
-                        'total', $1, 'passed', $2, 'failed', $3, 'pending', 0,
+                        'total', $1::integer, 'passed', $2::integer,
+                        'failed', $3::integer, 'pending', 0,
                         'score', to_char($2::numeric / NULLIF($1, 0), '0.0000'))
                 WHERE id = $4::uuid AND status <> 'completed'
                 """,

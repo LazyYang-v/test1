@@ -44,6 +44,8 @@ class Worker:
         *,
         graph: AnalysisGraph | None = None,
         fault_injector: FaultInjector | None = None,
+        fake_model=None,
+        live_model=None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -68,6 +70,8 @@ class Worker:
             self.gateway,
             settings,
             fault_injector=self.fault_injector,
+            fake_model=fake_model,
+            live_model=live_model,
         )
 
     async def close(self) -> None:

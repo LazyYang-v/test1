@@ -71,7 +71,7 @@ ALTER TABLE runtime.tasks
 -- principal: tokens are minted internally by the evaluation runner only.
 INSERT INTO identity.users (id, email, display_name, status)
 VALUES (
-    '00000000-0000-7000-8000-000000000e0a1'::uuid,
+    '00000000-0000-7000-8000-00000000e0a1'::uuid,
     'svc-eval@agentforge.internal',
     'Evaluation Service',
     'active'
@@ -80,7 +80,7 @@ ON CONFLICT (email) DO NOTHING;
 
 -- Fixture region for the benchmark tasks, granted read-only to the service.
 INSERT INTO identity.region_grants (id, user_id, region_code, permission)
-SELECT '00000000-0000-7000-8000-000000000e0a2'::uuid,
+SELECT '00000000-0000-7000-8000-00000000e0a2'::uuid,
        service.id, 'CN_EAST', 'read'
 FROM identity.users AS service
 WHERE service.email = 'svc-eval@agentforge.internal'
@@ -98,7 +98,7 @@ INSERT INTO evaluation.datasets (
     data_snapshot_id, status
 )
 VALUES (
-    '00000000-0000-7000-8000-000000000e0b1'::uuid,
+    '00000000-0000-7000-8000-00000000e0b1'::uuid,
     'p0-core-business-analysis',
     1,
     'P0 core business analysis benchmark',
@@ -114,62 +114,62 @@ INSERT INTO evaluation.cases (
     data_snapshot_ref
 )
 VALUES
-    ('00000000-0000-7000-8000-000000000e0c01'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-01',
+    ('00000000-0000-7000-8000-000000000e01'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-01',
      '{"question":"Evaluate the frozen fixture for BA-01","region_codes":["CN_EAST"],"date_range":{"start":"2025-01-22","end_exclusive":"2025-01-29","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"509476.21","previous_value":"56000.00","absolute_change":"453476.21"}',
      '{"positive_growth":true}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c02'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-02',
+    ('00000000-0000-7000-8000-000000000e02'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-02',
      '{"question":"Evaluate the frozen fixture for BA-02","region_codes":["CN_EAST"],"date_range":{"start":"2025-03-31","end_exclusive":"2025-04-07","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"57400.00","previous_value":"70000.00","absolute_change":"-12600.00","change_rate":"-0.1800"}',
      '{"change_rate":"-0.1800"}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c03'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-03',
+    ('00000000-0000-7000-8000-000000000e03'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-03',
      '{"question":"Evaluate the frozen fixture for BA-03","region_codes":["CN_EAST"],"date_range":{"start":"2025-01-15","end_exclusive":"2025-01-22","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"56000.00","previous_value":"0.00","absolute_change":"56000.00","change_rate":null}',
      '{"required_annotations":["ZERO_BASELINE"]}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c04'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-04',
+    ('00000000-0000-7000-8000-000000000e04'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-04',
      '{"question":"Evaluate the frozen fixture for BA-04","region_codes":["CN_EAST"],"date_range":{"start":"2025-01-08","end_exclusive":"2025-01-15","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"0.00","previous_value":"526499.78","absolute_change":"-526499.78","change_rate":"-1.0000"}',
      '{"required_annotations":["DATA_INSUFFICIENT"],"expected_row_count":0}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c05'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-05',
+    ('00000000-0000-7000-8000-000000000e05'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-05',
      '{"question":"Evaluate the frozen fixture for BA-05","region_codes":["CN_EAST"],"date_range":{"start":"2025-01-31","end_exclusive":"2025-02-01","timezone":"Asia/Shanghai"},"compare_mode":"previous_period"}',
      '{"current_value":"73250.53","previous_value":"77316.52","absolute_change":"-4065.99","change_rate":"-0.0526"}',
      '{"timezone":"Asia/Shanghai"}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c06'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-06',
+    ('00000000-0000-7000-8000-000000000e06'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-06',
      '{"question":"Evaluate the frozen fixture for BA-06","region_codes":["CN_EAST"],"date_range":{"start":"2025-01-23","end_exclusive":"2025-01-24","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"73418.81","previous_value":"72227.60","absolute_change":"1191.21"}',
      '{"paid_orders_only":true,"source_view":"business.gmv_v1"}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c07'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-07',
+    ('00000000-0000-7000-8000-000000000e07'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-07',
      '{"question":"Evaluate the frozen fixture for BA-07","region_codes":["CN_EAST"],"date_range":{"start":"2025-02-10","end_exclusive":"2025-02-11","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"71410.41","previous_value":"76368.69","absolute_change":"-4958.28"}',
      '{"refunded_orders_included":true,"source_view":"business.gmv_v1"}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c08'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-08',
+    ('00000000-0000-7000-8000-000000000e08'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-08',
      '{"question":"Evaluate the frozen fixture for BA-08","region_codes":["CN_EAST"],"date_range":{"start":"2025-03-31","end_exclusive":"2025-04-07","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"57400.00","previous_value":"70000.00","absolute_change":"-12600.00","change_rate":"-0.1800"}',
      '{"authorized_regions_only":["CN_EAST"]}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c09'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-09',
+    ('00000000-0000-7000-8000-000000000e09'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-09',
      '{"question":"Evaluate the frozen fixture for BA-09","region_codes":["CN_EAST"],"date_range":{"start":"2025-03-31","end_exclusive":"2025-04-07","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"57400.00","previous_value":"70000.00","absolute_change":"-12600.00","change_rate":"-0.1800"}',
      '{"hypotheses_unverified":true,"source_view":"business.gmv_v1"}',
      'e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8'),
-    ('00000000-0000-7000-8000-000000000e0c10'::uuid,
-     '00000000-0000-7000-8000-000000000e0b1'::uuid, 'BA-10',
+    ('00000000-0000-7000-8000-000000000e0a'::uuid,
+     '00000000-0000-7000-8000-00000000e0b1'::uuid, 'BA-10',
      '{"question":"Evaluate the frozen fixture for BA-10","region_codes":["CN_EAST"],"date_range":{"start":"2025-03-31","end_exclusive":"2025-04-07","timezone":"UTC"},"compare_mode":"previous_period"}',
      '{"current_value":"57400.00"}',
      '{"findings_reference_valid_evidence":true,"source_view":"business.gmv_v1"}',
@@ -181,6 +181,16 @@ GRANT USAGE ON SCHEMA evaluation TO agentforge_eval;
 GRANT SELECT ON evaluation.datasets, evaluation.cases, evaluation.runs,
     evaluation.case_results TO agentforge_eval;
 GRANT SELECT (eval_run_id) ON runtime.tasks TO agentforge_eval;
+
+-- The API creates runs/case_results; the Worker reserves live budgets and
+-- materializes results. Neither may delete or alter dataset fixtures.
+GRANT USAGE ON SCHEMA evaluation TO agentforge_api, agentforge_worker;
+GRANT SELECT ON evaluation.datasets, evaluation.cases
+    TO agentforge_api, agentforge_worker;
+GRANT SELECT, INSERT, UPDATE ON evaluation.runs
+    TO agentforge_api, agentforge_worker;
+GRANT SELECT, INSERT, UPDATE ON evaluation.case_results
+    TO agentforge_api, agentforge_worker;
 
 REVOKE ALL ON evaluation.datasets, evaluation.cases, evaluation.runs,
     evaluation.case_results FROM PUBLIC;
