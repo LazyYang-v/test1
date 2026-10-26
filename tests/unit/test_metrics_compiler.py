@@ -336,6 +336,20 @@ def test_sql_validator_accepts_ungrouped_compiler_query():
     SQLValidator.validate(compiled.sql, GMV_DEFINITION, ())
 
 
+def test_sql_validator_rejects_weakened_region_scope_predicate():
+    compiled = compile_metric_query(
+        _plan(), definition=GMV_DEFINITION, region_scope=("CN_EAST",),
+        data_snapshot_id=SNAPSHOT_ID,
+    )
+    weakened_sql = compiled.sql.replace(
+        "region_code = ANY($2::text[])",
+        "region_code >= ANY($2::text[])",
+    )
+
+    with pytest.raises(SQLValidationError):
+        SQLValidator.validate(weakened_sql, GMV_DEFINITION, ("region_code",))
+
+
 @pytest.mark.parametrize(
     "sql",
     [

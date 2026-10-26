@@ -30,16 +30,23 @@ _SOURCE_COLUMNS = {
         {"data_snapshot_id", "paid_amount", "paid_at", "region_code"}
     )
 }
+_SOURCE_ALLOWED_DIMENSIONS = {
+    "business.gmv_v1": frozenset({"region_code"}),
+}
+_SOURCE_ALLOWED_FILTERS = {
+    "business.gmv_v1": frozenset({"region_code", "paid_at"}),
+}
+_SOURCE_EXPRESSIONS = {
+    "business.gmv_v1": frozenset({"paid_amount_sum"}),
+}
 _ALLOWED_SQL_NODES = frozenset({
     "A_Const",
     "A_Expr",
     "BoolExpr",
     "CoalesceExpr",
     "ColumnRef",
-    "Float",
     "FuncCall",
     "Integer",
-    "MinMaxExpr",
     "ParamRef",
     "RangeVar",
     "ResTarget",
@@ -248,16 +255,26 @@ class SemanticValidator:
             raise QueryPlanError("metric version is not registered")
         if intent.comparison != "previous_period":
             raise QueryPlanError("comparison mode is not supported")
+        source = definition.source_view
+        if source not in _SOURCE_COLUMNS:
+            raise QueryPlanError("metric source view is outside platform policy")
         if any(
-            item not in definition.allowed_dimensions for item in intent.dimensions
+            item not in definition.allowed_dimensions
+            or item not in _SOURCE_ALLOWED_DIMENSIONS[source]
+            for item in intent.dimensions
         ):
             raise QueryPlanError("dimensions are outside the registered schema")
-        if definition.expression_key not in _EXPRESSION_SQL:
-            raise QueryPlanError("metric expression is not platform registered")
+        registered_expression = _EXPRESSION_SQL.get(definition.expression_key)
+        expected_aggregation = (
+            "SUM" if definition.expression_key == "paid_amount_sum" else None
+        )
         if (
-            definition.source_view not in _SOURCE_COLUMNS
-            or definition.time_column not in _SOURCE_COLUMNS[definition.source_view]
-            or definition.aggregation != "SUM"
+            registered_expression is None
+            or definition.expression_key not in _SOURCE_EXPRESSIONS[source]
+            or definition.aggregation != expected_aggregation
+            or definition.source_view != "business.gmv_v1"
+            or definition.time_column != "paid_at"
+            or registered_expression[0] != "SUM(paid_amount)"
         ):
             raise QueryPlanError("metric definition is outside platform policy")
 
@@ -265,10 +282,15 @@ class SemanticValidator:
         # column is supplied only via the typed time_range above.
         if set(intent.filters) != {"region_code"}:
             raise QueryPlanError("filters are outside the registered schema")
-        if not {"region_code", definition.time_column}.issubset(
-            definition.allowed_filters
+        if (
+            not {"region_code", definition.time_column}.issubset(
+                definition.allowed_filters
+            )
+            or not definition.allowed_filters.issubset(
+                _SOURCE_ALLOWED_FILTERS[source]
+            )
         ):
-            raise QueryPlanError("required region/time filters are not registered")
+            raise QueryPlanError("filters are outside the registered schema")
         requested = intent.filters["region_code"]
         if not isinstance(requested, list) or not requested or any(
             not isinstance(item, str) or not item.strip() for item in requested
@@ -331,6 +353,130 @@ def _walk_ast(value: Any) -> Iterator[Node]:
     elif isinstance(value, (list, tuple)):
         for child in value:
             yield from _walk_ast(child)
+
+
+def _is_column(node: Any, name: str) -> bool:
+    return (
+        type(node).__name__ == "ColumnRef"
+        and len(node.fields) == 1
+        and type(node.fields[0]).__name__ == "String"
+        and node.fields[0].sval == name
+    )
+
+
+def _is_param(node: Any, number: int) -> bool:
+    return type(node).__name__ == "ParamRef" and node.number == number
+
+
+def _is_text_array_param(node: Any, number: int) -> bool:
+    if type(node).__name__ != "TypeCast" or not _is_param(node.arg, number):
+        return False
+    type_name = node.typeName
+    return (
+        tuple(part.sval for part in type_name.names
+              if type(part).__name__ == "String") == ("text",)
+        and len(type_name.arrayBounds) == 1
+    )
+
+
+def _is_comparison(
+    node: Any, operator: str, left: Any, right: Any, *, kind: A_Expr_Kind
+) -> bool:
+    return (
+        type(node).__name__ == "A_Expr"
+        and node.kind == kind
+        and len(node.name) == 1
+        and type(node.name[0]).__name__ == "String"
+        and node.name[0].sval == operator
+        and left(node.lexpr)
+        and right(node.rexpr)
+    )
+
+
+def _is_and(node: Any, *predicates: Any) -> bool:
+    return (
+        type(node).__name__ == "BoolExpr"
+        and node.boolop == BoolExprType.AND_EXPR
+        and len(node.args) == len(predicates)
+        and all(
+            predicate(actual)
+            for predicate, actual in zip(predicates, node.args, strict=True)
+        )
+    )
+
+
+def _is_function_named(node: Any, name: str) -> bool:
+    return (
+        type(node).__name__ == "FuncCall"
+        and tuple(
+            part.sval for part in node.funcname
+            if type(part).__name__ == "String"
+        ) == (name,)
+    )
+
+
+def _is_period_filter(node: Any, start_param: int, end_param: int) -> bool:
+    return _is_and(
+        node,
+        lambda item: _is_comparison(
+            item, ">=", lambda expr: _is_column(expr, "paid_at"),
+            lambda expr: _is_param(expr, start_param), kind=A_Expr_Kind.AEXPR_OP,
+        ),
+        lambda item: _is_comparison(
+            item, "<", lambda expr: _is_column(expr, "paid_at"),
+            lambda expr: _is_param(expr, end_param), kind=A_Expr_Kind.AEXPR_OP,
+        ),
+    )
+
+
+def _is_zero_numeric(node: Any) -> bool:
+    return (
+        type(node).__name__ == "TypeCast"
+        and tuple(
+            part.sval for part in node.typeName.names
+            if type(part).__name__ == "String"
+        ) == ("pg_catalog", "numeric")
+        and type(node.arg).__name__ == "A_Const"
+        and not node.arg.isnull
+        and type(node.arg.val).__name__ == "Integer"
+        and node.arg.val.ival == 0
+    )
+
+
+def _is_sum_period(node: Any, start_param: int, end_param: int) -> bool:
+    return (
+        _is_function_named(node, "sum")
+        and len(node.args or ()) == 1
+        and _is_column(node.args[0], "paid_amount")
+        and _is_period_filter(node.agg_filter, start_param, end_param)
+        and not node.agg_star
+        and not node.agg_distinct
+        and not node.agg_order
+        and node.over is None
+    )
+
+
+def _is_count_period(node: Any, start_param: int, end_param: int) -> bool:
+    return (
+        _is_function_named(node, "count")
+        and node.agg_star
+        and not node.args
+        and _is_period_filter(node.agg_filter, start_param, end_param)
+        and not node.agg_distinct
+        and not node.agg_order
+        and node.over is None
+    )
+
+
+def _is_coalesced_sum_period(
+    node: Any, start_param: int, end_param: int
+) -> bool:
+    return (
+        type(node).__name__ == "CoalesceExpr"
+        and len(node.args) == 2
+        and _is_sum_period(node.args[0], start_param, end_param)
+        and _is_zero_numeric(node.args[1])
+    )
 
 
 class SQLValidator:
@@ -397,12 +543,53 @@ class SQLValidator:
         )
         if actual_outputs != expected_outputs:
             raise SQLValidationError("compiled SQL result columns are unsupported")
+        dimension_targets = targets[: len(dimensions)]
+        if any(
+            not _is_column(target.val, dimension)
+            for target, dimension in zip(dimension_targets, dimensions, strict=True)
+        ):
+            raise SQLValidationError("compiled SQL dimensions are unsupported")
+        metric_targets = targets[len(dimensions) :]
+        if not (
+            _is_coalesced_sum_period(metric_targets[0].val, 5, 6)
+            and _is_coalesced_sum_period(metric_targets[1].val, 7, 8)
+            and _is_count_period(metric_targets[2].val, 5, 6)
+            and _is_count_period(metric_targets[3].val, 7, 8)
+        ):
+            raise SQLValidationError("compiled SQL metric expressions are unsupported")
         if (
             statement.limitCount is None
             or type(statement.limitCount).__name__ != "ParamRef"
             or statement.limitCount.number != 9
         ):
             raise SQLValidationError("compiled SQL must bind the row limit")
+
+        if not _is_and(
+            statement.whereClause,
+            lambda node: _is_comparison(
+                node,
+                "=",
+                lambda value: _is_column(value, "data_snapshot_id"),
+                lambda value: _is_param(value, 1),
+                kind=A_Expr_Kind.AEXPR_OP,
+            ),
+            lambda node: _is_comparison(
+                node,
+                "=",
+                lambda value: _is_column(value, "region_code"),
+                lambda value: _is_text_array_param(value, 2),
+                kind=A_Expr_Kind.AEXPR_OP_ANY,
+            ),
+            lambda node: _is_comparison(
+                node, ">=", lambda value: _is_column(value, definition.time_column),
+                lambda value: _is_param(value, 3), kind=A_Expr_Kind.AEXPR_OP,
+            ),
+            lambda node: _is_comparison(
+                node, "<", lambda value: _is_column(value, definition.time_column),
+                lambda value: _is_param(value, 4), kind=A_Expr_Kind.AEXPR_OP,
+            ),
+        ):
+            raise SQLValidationError("compiled SQL scope predicates are unsupported")
 
         parameter_numbers: set[int] = set()
         expected_columns = {
