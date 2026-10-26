@@ -4,7 +4,7 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Worker 以 SKIP LOCKED 认领；两 Worker 并发领取只有一个有效租约（RT-04）
 - [ ] 心跳按间隔续期租约（RT-05）；Attempt 记录 worker/lease_token/fencing_epoch
@@ -14,3 +14,7 @@
 - [ ] 结果符合报告 Schema：findings 引用有效证据 ID、hypotheses 标注待验证、limitations 齐全；validate_report 拒绝引用不存在证据（BA-10 结构）
 - [ ] 任务 → completed，result_json 与 completed_at 持久化，事件序完整可读
 - [ ] 数据库事务短小：节点执行期间不持有 Task 行锁
+
+## Comments
+
+2026-10-26: Implementation started on `ticket/06-tracer-bullet-task-completion` (branched from `integration/p0` tip `9e7dc39`). Scope: migration 0008, `packages/runtime`, `packages/harness`, `apps/worker`, LangGraph in-process MemorySaver, deterministic fake model and the nine-step tool gateway skeleton. Ticket remains claimed until integration verification.
