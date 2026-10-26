@@ -86,7 +86,12 @@ async def test_queued_cancel_events_wake_live_sse_subscriber(migrated_db):
         response = await post_cancel_via_api(db, task_id, 1)
         assert response.status_code == 202
         await asyncio.wait_for(stream["wait_for_events"](2), timeout=2)
-        assert stream["body"]() == (
+        event_frames = b"".join(
+            frame + b"\n\n"
+            for frame in stream["body"]().split(b"\n\n")
+            if frame and not frame.startswith(b":")
+        )
+        assert event_frames == (
             b'id: 2\nevent: task.cancel.requested\ndata: '
             b'{"expected_version":1,"reason":"operator requested cancellation",'
             b'"requested_by":"0192a3b4-c5d6-7e8f-9012-3456789abcde",'

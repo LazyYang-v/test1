@@ -1176,10 +1176,9 @@ async def test_task_events_stream_limit_returns_retry_after(seeded_tasks_db):
 
 async def test_task_events_stream_requires_authentication(seeded_tasks_db):
     db = seeded_tasks_db
-    missing = await AsyncClient(
+    async with AsyncClient(
         transport=ASGITransport(app=_app(db)), base_url="http://testserver"
-    )
-    async with missing:
+    ) as missing:
         response = await missing.get(
             "/api/v1/tasks/00000000-0000-0000-0000-000000000001/events"
         )
@@ -1556,10 +1555,10 @@ async def test_task_events_stream_rejects_invalid_last_event_id(seeded_tasks_db,
         await conn.execute(
             """
             INSERT INTO runtime.tasks
-                (id, owner_user_id, agent_version_id, task_type, status,
+                (id, trace_id, owner_user_id, agent_version_id, task_type, status,
                  input_json, input_hash, region_scope_json, authorization_snapshot,
                  data_snapshot_id)
-            SELECT $1::uuid, $2::uuid, id, 'business_analysis', 'queued',
+            SELECT $1::uuid, $1::text, $2::uuid, id, 'business_analysis', 'queued',
                    '{}'::jsonb, repeat('a', 64), '[]'::jsonb, '[]'::jsonb,
                    (SELECT data_snapshot_id FROM business.data_snapshots LIMIT 1)
             FROM registry.agent_versions WHERE id = $3::uuid
