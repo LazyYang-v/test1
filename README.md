@@ -8,7 +8,9 @@ The local defaults are for development only. Copy `.env.example` to `.env` and r
 docker compose up --build
 ```
 
-The API is available at `http://localhost:8000`. `/health/live` reports process liveness; `/health/ready` returns success only when PostgreSQL is reachable and the applied migration version matches this API. The PostgreSQL healthcheck probes TCP so the temporary Unix-socket-only initialization server cannot satisfy it.
+The API is available at `http://localhost:8000`; the React analysis workspace is available at `http://localhost:3000`. The web service proxies API requests to the API container under the same browser origin. `/health/live` reports process liveness; `/health/ready` returns success only when PostgreSQL is reachable and the applied migration version matches this API. The PostgreSQL healthcheck probes TCP so the temporary Unix-socket-only initialization server cannot satisfy it.
+
+The frontend uses bearer-authenticated `fetch` for the durable event stream because native browser `EventSource` cannot set the API's `Authorization` header. It reconnects with `Last-Event-ID` and deduplicates events by task sequence. See [apps/web/README.md](apps/web/README.md) for the UI and authentication details.
 
 ## Task event streams
 
