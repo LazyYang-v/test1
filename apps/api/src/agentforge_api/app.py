@@ -22,6 +22,7 @@ from agentforge_api.auth import (
 )
 from agentforge_api.config import Settings
 from agentforge_api.readiness import check_database_readiness
+from agentforge_api.tasks import router as task_router
 
 
 @asynccontextmanager
@@ -124,6 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         yield
 
     app = FastAPI(title="AgentForge API", lifespan=lifespan)
+    app.include_router(task_router)
     # ASGI tests may use HTTPX's ASGITransport without starting lifespan.
     app.state.settings = app_settings
     app.state.connect = lambda: _database_connection(app_settings.api_db_dsn)
@@ -163,6 +165,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "The request could not be completed",
             )
         return _error_response(request, api_error)
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, error: Exception) -> JSONResponse:
+        del error
+        return _error_response(
+            request,
+            ApiError(500, "INTERNAL_ERROR", "The request could not be completed"),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
