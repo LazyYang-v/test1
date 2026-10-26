@@ -99,10 +99,10 @@ async def _seed_task(migrated_db) -> None:
         await conn.execute(
             """
             INSERT INTO runtime.tasks
-                (id, owner_user_id, agent_version_id, task_type, status, input_json,
+                (id, trace_id, owner_user_id, agent_version_id, task_type, status, input_json,
                  input_hash, region_scope_json, authorization_snapshot,
                  data_snapshot_id, deadline_at)
-            VALUES ($1::uuid, $2::uuid, $3::uuid, 'business_analysis', 'running',
+            VALUES ($1::uuid, $1::text, $2::uuid, $3::uuid, 'business_analysis', 'running',
                     '{"question":"test"}'::jsonb, $4, '["CN_EAST"]'::jsonb,
                     '[{"region_code":"CN_EAST","permission":"read"}]'::jsonb,
                     $5, now() + interval '5 minutes')

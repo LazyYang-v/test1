@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any, Literal
@@ -15,7 +16,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
+from agentforge_core.observability import log_event, span
 
+logger = logging.getLogger("agentforge.api")
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
 
@@ -308,10 +311,10 @@ async def create_task(
                 created_at = await conn.fetchval(
                     """
                     INSERT INTO runtime.tasks
-                        (id, owner_user_id, agent_version_id, task_type, status,
+                        (id, trace_id, owner_user_id, agent_version_id, task_type, status,
                          input_json, input_hash, region_scope_json, authorization_snapshot,
                          data_snapshot_id, max_attempts, deadline_at)
-                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
+                    VALUES ($1::uuid, $1::text, $2::uuid, $3::uuid, $4, 'queued', $5::jsonb, $6,
                             $7::jsonb, $8::jsonb, $9, $10,
                             now() + ($11 * interval '1 second'))
                     RETURNING created_at
@@ -342,7 +345,7 @@ async def create_task(
                 """,
                 task_id,
                 _canonical({"status": "queued"}),
-                request.state.request_id,
+                task_id,
             )
             await conn.execute(
                 """
@@ -360,7 +363,7 @@ async def create_task(
                     "region_codes": body.input.region_codes,
                     "data_snapshot_id": snapshot["data_snapshot_id"].strip(),
                 }),
-                request.state.request_id,
+                task_id,
             )
             response = _task_response(
                 task_id, agent_version=agent["version"], created_at=created_at
@@ -376,6 +379,15 @@ async def create_task(
                 task_id,
                 _canonical(response),
             )
+    with span("task.create", trace_id=task_id, task_id=task_id):
+        log_event(
+            logger,
+            logging.INFO,
+            "task.created",
+            request_id=request.state.request_id,
+            trace_id=task_id,
+            task_id=task_id,
+        )
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 

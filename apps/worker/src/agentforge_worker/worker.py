@@ -13,6 +13,7 @@ from agentforge_harness.report import ReportValidationError
 from agentforge_runtime.contracts import AttemptLease
 from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_runtime.store import RuntimeStore
+from agentforge_core.observability import log_event
 
 from agentforge_worker.config import WorkerSettings
 from agentforge_worker.executors import MetricsQueryExecutor
@@ -68,7 +69,12 @@ class Worker:
         return True
 
     async def run_forever(self) -> None:
-        logger.info("worker started", extra={"worker_id": self.settings.worker_id})
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.started",
+            worker_id=self.settings.worker_id,
+        )
         while True:
             claimed = await self.run_once()
             if not claimed:
@@ -83,11 +89,19 @@ class Worker:
                 try:
                     alive = await self.store.heartbeat(lease)
                 except Exception:
-                    logger.exception(
-                        "heartbeat failed",
-                        extra={"task_id": lease.task_id, "attempt_id": lease.attempt_id},
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "heartbeat.failed",
+                        trace_id=lease.trace_id,
+                        task_id=lease.task_id,
+                        attempt_id=lease.attempt_id,
+                        error_code="HEARTBEAT_UNCERTAIN",
                     )
-                    alive = False
+                    # A database error is not evidence that this lease is lost.
+                    # Keep running while the store's uncertainty policy retries.
+                    await asyncio.sleep(self.settings.heartbeat_interval_seconds)
+                    continue
                 if not alive:
                     lease_lost.set()
                     return
@@ -110,13 +124,14 @@ class Worker:
                 with contextlib.suppress(BaseException):
                     await graph_task
                 await self.store.abandon_attempt(lease)
-                logger.warning(
-                    "lease lost during execution",
-                    extra={
-                        "task_id": lease.task_id,
-                        "attempt_id": lease.attempt_id,
-                        "fencing_epoch": lease.fencing_epoch,
-                    },
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "lease.lost",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code="LEASE_LOST",
                 )
                 return
 
@@ -133,9 +148,14 @@ class Worker:
             except LeaseLostError:
                 await self.store.abandon_attempt(lease)
             except TaskNotRunningError as error:
-                logger.warning(
-                    "task left running before completion",
-                    extra={"task_id": lease.task_id, "error_code": error.code},
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "task.completion_skipped",
+                    trace_id=lease.trace_id,
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                    error_code=error.code,
                 )
         finally:
             stop.set()
@@ -146,13 +166,14 @@ class Worker:
 
     async def _fail(self, lease: AttemptLease, error: BaseException) -> None:
         code = classify_error(error)
-        logger.info(
-            "attempt failed",
-            extra={
-                "task_id": lease.task_id,
-                "attempt_id": lease.attempt_id,
-                "error_code": code,
-            },
+        log_event(
+            logger,
+            logging.ERROR,
+            "attempt.failed",
+            trace_id=lease.trace_id,
+            task_id=lease.task_id,
+            attempt_id=lease.attempt_id,
+            error_code=code,
         )
         try:
             await self.store.fail_task(lease, code, str(error))
