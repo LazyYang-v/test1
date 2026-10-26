@@ -58,6 +58,14 @@ class UnsupportedGraphError(RuntimeError):
     code = "GRAPH_UNSUPPORTED"
 
 
+class EvaluationBudgetError(RuntimeError):
+    code = "BUDGET_EXCEEDED"
+
+
+class LiveModelUnavailableError(RuntimeError):
+    code = "LIVE_MODEL_UNAVAILABLE"
+
+
 class RuntimeModelRecorder:
     """Persists each physical model call, including failed validation attempts."""
 
@@ -69,12 +77,18 @@ class RuntimeModelRecorder:
         agent_version_id: str,
         provider: str,
         model_name: str,
+        evaluation_run_id: str | None = None,
+        model_mode: str | None = None,
+        live_call_budget: int | None = None,
     ) -> None:
         self._pool = pool
         self._lease = lease
         self._agent_version_id = agent_version_id
         self._provider = provider
         self._model_name = model_name
+        self._evaluation_run_id = evaluation_run_id
+        self._model_mode = model_mode
+        self._live_call_budget = live_call_budget
         self._started_at: dict[str, float] = {}
         self._request_parameters: dict[str, dict[str, Any]] = {}
 
@@ -93,6 +107,60 @@ class RuntimeModelRecorder:
         self, invocation_key: str, request: ModelRequest
     ) -> None:
         async with self._pool.acquire() as conn:
+            if self._evaluation_run_id is not None and self._model_mode == "live":
+                async with conn.transaction():
+                    run = await conn.fetchrow(
+                        """
+                        UPDATE evaluation.runs
+                        SET live_calls_used = live_calls_used + 1, status = 'running'
+                        WHERE id = $1::uuid AND model_mode = 'live'
+                          AND live_call_budget = $2
+                          AND live_calls_used < $2
+                          AND EXISTS (
+                              SELECT 1
+                              FROM runtime.tasks AS task
+                              JOIN runtime.task_attempts AS attempt
+                                ON attempt.id = $4::uuid AND attempt.task_id = task.id
+                              WHERE task.id = $3::uuid AND task.status = 'running'
+                                AND task.cancel_requested_at IS NULL
+                                AND (task.deadline_at IS NULL OR task.deadline_at > now())
+                                AND attempt.lease_token = $5::uuid
+                                AND attempt.fencing_epoch = $6
+                                AND attempt.status = 'running'
+                                AND attempt.lease_expires_at > now()
+                          )
+                        RETURNING live_calls_used
+                        """,
+                        self._evaluation_run_id,
+                        self._live_call_budget,
+                        self._lease.task_id,
+                        self._lease.attempt_id,
+                        self._lease.lease_token,
+                        self._lease.fencing_epoch,
+                    )
+                    if run is None:
+                        raise EvaluationBudgetError(
+                            "Live evaluation call budget is exhausted or the Task lease is no longer active"
+                        )
+                    await conn.execute(
+                        """
+                        INSERT INTO harness.model_invocations
+                            (id, task_id, attempt_id, invocation_key, agent_version_id,
+                             provider, model_name, context_hash, status, started_at)
+                        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8,
+                                'executing', now())
+                        ON CONFLICT (task_id, invocation_key) DO NOTHING
+                        """,
+                        str(uuid.uuid4()),
+                        self._lease.task_id,
+                        self._lease.attempt_id,
+                        invocation_key,
+                        self._agent_version_id,
+                        self._provider,
+                        self._model_name,
+                        request.context_hash or _hash(request.messages),
+                    )
+                return
             await conn.execute(
                 """
                 INSERT INTO harness.model_invocations
@@ -185,30 +253,65 @@ class AnalysisGraph:
         model,
         gateway: ToolGateway,
         settings: WorkerSettings,
+        *,
+        fake_model=None,
+        live_model=None,
     ) -> None:
         self._store = store
         self._model = model
+        self._fake_model = fake_model
+        self._live_model = live_model
         self._gateway = gateway
         self._settings = settings
 
     async def run(self, lease: AttemptLease) -> dict[str, Any]:
         task = await self._store.load_task(lease.task_id)
         agent = await self._store.load_agent(task["agent_version_id"])
+        model = self._model
+        evaluation_run_id = task.get("evaluation_run_id")
+        live_call_budget = None
+        model_mode = None
+        if evaluation_run_id is not None:
+            async with self._store.pool.acquire() as conn:
+                evaluation = await conn.fetchrow(
+                    "SELECT model_mode, live_call_budget FROM evaluation.runs "
+                    "WHERE id = $1::uuid",
+                    evaluation_run_id,
+                )
+            if evaluation is None:
+                raise UnsupportedGraphError("evaluation run is missing")
+            model_mode = evaluation["model_mode"]
+            if model_mode == "fake":
+                if self._fake_model is None:
+                    raise UnsupportedGraphError("Fake Model is unavailable")
+                model = self._fake_model
+            elif model_mode == "live":
+                if self._live_model is None:
+                    raise LiveModelUnavailableError(
+                        "Live evaluation is enabled but no live model adapter is configured"
+                    )
+                model = self._live_model
+                live_call_budget = evaluation["live_call_budget"]
+            else:
+                raise UnsupportedGraphError("evaluation model mode is invalid")
         if agent["graph_key"] != "metrics-v1":
             raise UnsupportedGraphError(
                 f"unsupported graph_key {agent['graph_key']!r}"
             )
         adapter = (
-            self._model.resolve(agent)
-            if callable(getattr(self._model, "resolve", None))
-            else self._model
+            model.resolve(agent)
+            if callable(getattr(model, "resolve", None))
+            else model
         )
         recorder = RuntimeModelRecorder(
             pool=self._store.pool,
             lease=lease,
             agent_version_id=task["agent_version_id"],
-            provider=agent["provider"],
-            model_name=agent["model_name"],
+            provider=getattr(model, "provider", agent["provider"]),
+            model_name=getattr(model, "model_name", agent["model_name"]),
+            evaluation_run_id=evaluation_run_id,
+            model_mode=model_mode,
+            live_call_budget=live_call_budget,
         )
         model_timeout_seconds = self._model_timeout_seconds(agent)
         max_output_tokens = agent.get("max_output_tokens")
