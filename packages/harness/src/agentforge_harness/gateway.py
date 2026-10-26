@@ -16,6 +16,8 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 from jsonschema import Draft202012Validator
 
+from agentforge_core.faults import InjectedCrash
+
 __all__ = [
     "ToolContext",
     "ToolDescriptor",
@@ -406,6 +408,8 @@ class ToolGateway:
         except ToolError as error:
             await reject(error.code, str(error), descriptor)
             raise AssertionError("unreachable") from error
+        except InjectedCrash:
+            raise
         except Exception as error:  # executor failure is typed and closed
             await reject(
                 "TOOL_EXECUTION_FAILED", "registered tool executor failed", descriptor

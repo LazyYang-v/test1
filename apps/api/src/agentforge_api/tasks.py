@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentforge_api.auth import ApiError, current_principal
+from agentforge_core.faults import FaultPoint
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -397,6 +398,14 @@ async def create_task(
                 task_id,
                 _canonical(response),
             )
+            await request.app.state.fault_injector.checkpoint(
+                FaultPoint.TASK_CREATE_BEFORE_COMMIT,
+                {"task_id": task_id, "idempotency_key": idempotency_key},
+            )
+    await request.app.state.fault_injector.checkpoint(
+        FaultPoint.TASK_CREATE_AFTER_COMMIT,
+        {"task_id": task_id, "idempotency_key": idempotency_key},
+    )
     return JSONResponse(status_code=202, content=json.loads(_canonical(response)))
 
 

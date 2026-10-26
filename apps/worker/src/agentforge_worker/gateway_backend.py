@@ -10,6 +10,7 @@ from typing import Any
 
 import asyncpg
 
+from agentforge_core.faults import FaultInjector, FaultPoint, NOOP_FAULT_INJECTOR
 from agentforge_harness.gateway import ToolContext, ToolDescriptor
 from agentforge_runtime.store import RuntimeStore
 
@@ -29,9 +30,16 @@ def _json_value(value: Any) -> Any:
 class PostgresToolGatewayBackend:
     """All gateway state transitions use short, fenced transactions."""
 
-    def __init__(self, pool: asyncpg.Pool, store: RuntimeStore) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        store: RuntimeStore,
+        *,
+        fault_injector: FaultInjector | None = None,
+    ) -> None:
         self._pool = pool
         self._store = store
+        self._fault_injector = fault_injector or NOOP_FAULT_INJECTOR
 
     async def resolve_tool(self, tool_key: str) -> ToolDescriptor | None:
         async with self._pool.acquire() as conn:
@@ -223,6 +231,14 @@ class PostgresToolGatewayBackend:
             query_plan if query_plan is not None else request_json
         )
         result_hash = _hash(result)
+        await self._fault_injector.checkpoint(
+            FaultPoint.TOOL_RESULT_BEFORE_PERSIST,
+            {
+                "task_id": context.task_id,
+                "attempt_id": context.attempt_id,
+                "invocation_key": invocation_key,
+            },
+        )
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 task = await conn.fetchrow(
@@ -291,6 +307,8 @@ class PostgresToolGatewayBackend:
                         """
                         SELECT invocation.id::text AS id,
                                invocation.result_json,
+                               invocation.result_hash,
+                               invocation.status,
                                evidence.id::text AS evidence_id
                         FROM harness.tool_invocations AS invocation
                         LEFT JOIN harness.evidences AS evidence
@@ -301,80 +319,103 @@ class PostgresToolGatewayBackend:
                         context.task_id,
                         invocation_key,
                     )
-                    return {
-                        "result": (
-                            result
-                            if existing is None
-                            else _json_value(existing["result_json"])
-                        ),
-                        "evidence_id": None if existing is None else existing["evidence_id"],
+                    if existing is None or existing["status"] != "succeeded":
+                        return None
+                    existing_result = _json_value(existing["result_json"])
+                    if existing["result_hash"].strip() != _hash(existing_result):
+                        return None
+                    accepted = {
+                        "result": existing_result,
+                        "evidence_id": existing["evidence_id"],
                         "reused": True,
                     }
-
-                invocation_id = row["id"]
-                evidence = await conn.fetchrow(
-                    """
-                    INSERT INTO harness.evidences
-                        (id, task_id, attempt_id, tool_invocation_id, metric_key,
-                         metric_version, unit, current_value, previous_value,
-                         absolute_change, change_rate, query_plan_json,
-                         result_json, result_set_hash, row_count, data_snapshot_id)
-                    VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
-                            $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16)
-                    ON CONFLICT (tool_invocation_id)
-                        WHERE tool_invocation_id IS NOT NULL DO NOTHING
-                    RETURNING id::text AS evidence_id
-                    """,
-                    str(uuid.uuid4()),
-                    context.task_id,
-                    context.attempt_id,
-                    invocation_id,
-                    result["metric"],
-                    result["metric_version"],
-                    result["unit"],
-                    Decimal(str(result["current_value"])),
-                    Decimal(str(result["previous_value"])),
-                    Decimal(str(result["absolute_change"])),
-                    (
-                        None
-                        if result.get("change_rate") is None
-                        else Decimal(str(result["change_rate"]))
-                    ),
-                    query_plan_json,
-                    result_json,
-                    result_hash,
-                    result["row_count"],
-                    context.task_snapshot_id,
-                )
-                if evidence is None:
+                    persisted = False
+                else:
+                    invocation_id = row["id"]
                     evidence = await conn.fetchrow(
-                        "SELECT id::text AS evidence_id FROM harness.evidences "
-                        "WHERE tool_invocation_id = $1::uuid",
+                        """
+                        INSERT INTO harness.evidences
+                            (id, task_id, attempt_id, tool_invocation_id, metric_key,
+                             metric_version, unit, current_value, previous_value,
+                             absolute_change, change_rate, query_plan_json,
+                             result_json, result_set_hash, row_count, data_snapshot_id)
+                        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+                                $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16)
+                        ON CONFLICT (tool_invocation_id)
+                            WHERE tool_invocation_id IS NOT NULL DO NOTHING
+                        RETURNING id::text AS evidence_id
+                        """,
+                        str(uuid.uuid4()),
+                        context.task_id,
+                        context.attempt_id,
                         invocation_id,
+                        result["metric"],
+                        result["metric_version"],
+                        result["unit"],
+                        Decimal(str(result["current_value"])),
+                        Decimal(str(result["previous_value"])),
+                        Decimal(str(result["absolute_change"])),
+                        (
+                            None
+                            if result.get("change_rate") is None
+                            else Decimal(str(result["change_rate"]))
+                        ),
+                        query_plan_json,
+                        result_json,
+                        result_hash,
+                        result["row_count"],
+                        context.task_snapshot_id,
                     )
-                await conn.execute(
-                    """
-                    INSERT INTO audit.audit_events
-                        (actor_type, actor_id, action, resource_type, resource_id,
-                         decision, metadata_json, trace_id)
-                    VALUES ('worker', $1::uuid, 'tool.invocation', 'tool', $2,
-                            'allowed', $3::jsonb, $4)
-                    """,
-                    context.principal_id,
-                    descriptor.id,
-                    _canonical({
-                        "tool_key": descriptor.tool_key,
-                        "invocation_key": invocation_key,
-                        "step_key": context.step_key,
-                        "request_hash": request_hash,
+                    if evidence is None:
+                        evidence = await conn.fetchrow(
+                            "SELECT id::text AS evidence_id FROM harness.evidences "
+                            "WHERE tool_invocation_id = $1::uuid",
+                            invocation_id,
+                        )
+                    await conn.execute(
+                        """
+                        INSERT INTO audit.audit_events
+                            (actor_type, actor_id, action, resource_type, resource_id,
+                             decision, metadata_json, trace_id)
+                        VALUES ('worker', $1::uuid, 'tool.invocation', 'tool', $2,
+                                'allowed', $3::jsonb, $4)
+                        """,
+                        context.principal_id,
+                        descriptor.id,
+                        _canonical({
+                            "tool_key": descriptor.tool_key,
+                            "invocation_key": invocation_key,
+                            "step_key": context.step_key,
+                            "request_hash": request_hash,
+                            "evidence_id": evidence["evidence_id"],
+                            "attempt_id": context.attempt_id,
+                            "fencing_epoch": context.fencing_epoch,
+                        }),
+                        context.trace_id,
+                    )
+                    await self._fault_injector.checkpoint(
+                        FaultPoint.TOOL_RESULT_BEFORE_COMMIT,
+                        {
+                            "task_id": context.task_id,
+                            "attempt_id": context.attempt_id,
+                            "invocation_key": invocation_key,
+                            "evidence_id": evidence["evidence_id"],
+                        },
+                    )
+                    accepted = {
+                        "result": result,
                         "evidence_id": evidence["evidence_id"],
-                        "attempt_id": context.attempt_id,
-                        "fencing_epoch": context.fencing_epoch,
-                    }),
-                    context.trace_id,
-                )
-                return {
-                    "result": result,
-                    "evidence_id": evidence["evidence_id"],
-                    "reused": False,
-                }
+                        "reused": False,
+                    }
+                    persisted = True
+        if persisted:
+            await self._fault_injector.checkpoint(
+                FaultPoint.TOOL_RESULT_PERSISTED,
+                {
+                    "task_id": context.task_id,
+                    "attempt_id": context.attempt_id,
+                    "invocation_key": invocation_key,
+                    "evidence_id": accepted["evidence_id"],
+                },
+            )
+        return accepted

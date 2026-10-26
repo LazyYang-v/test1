@@ -13,6 +13,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from agentforge_harness.gateway import ToolContext, ToolGateway
+from agentforge_core.faults import (
+    FaultInjector,
+    FaultPoint,
+    InjectedCrash,
+    NOOP_FAULT_INJECTOR,
+)
 from agentforge_harness.models import (
     ModelOutputError,
     ModelRequest,
@@ -47,6 +53,22 @@ class AnalysisState(TypedDict, total=False):
     evidence_ids: list[str]
     compose: dict[str, Any]
     report: dict[str, Any]
+
+
+class FaultAwareMemorySaver(InMemorySaver):
+    """Inject at process-local checkpoint saves without treating them as durable."""
+
+    def __init__(self, fault_injector: FaultInjector) -> None:
+        super().__init__()
+        self._fault_injector = fault_injector
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        saved = await super().aput(config, checkpoint, metadata, new_versions)
+        await self._fault_injector.checkpoint(
+            FaultPoint.GRAPH_CHECKPOINT_SAVED,
+            {"thread_id": config.get("configurable", {}).get("thread_id")},
+        )
+        return saved
 
 
 class UnsupportedGraphError(RuntimeError):
@@ -134,11 +156,14 @@ class AnalysisGraph:
         model,
         gateway: ToolGateway,
         settings: WorkerSettings,
+        *,
+        fault_injector: FaultInjector | None = None,
     ) -> None:
         self._store = store
         self._model = model
         self._gateway = gateway
         self._settings = settings
+        self._fault_injector = fault_injector or NOOP_FAULT_INJECTOR
 
     async def run(self, lease: AttemptLease) -> dict[str, Any]:
         task = await self._store.load_task(lease.task_id)
@@ -185,6 +210,7 @@ class AnalysisGraph:
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
                     before_call=lambda: self._require_live(lease),
+                    fault_injector=self._fault_injector,
                 )
                 return content
 
@@ -268,6 +294,7 @@ class AnalysisGraph:
                     max_repairs=self._settings.max_model_repairs,
                     recorder=recorder,
                     before_call=lambda: self._require_live(lease),
+                    fault_injector=self._fault_injector,
                 )
                 return content
 
@@ -331,7 +358,9 @@ class AnalysisGraph:
         builder.add_edge("execute_metrics", "compose_analysis")
         builder.add_edge("compose_analysis", "validate_report")
         builder.add_edge("validate_report", END)
-        graph = builder.compile(checkpointer=InMemorySaver())
+        graph = builder.compile(
+            checkpointer=FaultAwareMemorySaver(self._fault_injector)
+        )
 
         final_state = await graph.ainvoke(
             AnalysisState(),
@@ -373,6 +402,8 @@ class AnalysisGraph:
             # Cooperative cancellation must not be converted into a failed step.
             raise
         except BaseException as error:
+            if isinstance(error, InjectedCrash):
+                raise
             try:
                 await self._store.fail_step(
                     lease,
