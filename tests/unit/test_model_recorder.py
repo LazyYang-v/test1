@@ -44,7 +44,7 @@ async def test_invocation_record_keeps_provider_metadata_and_timing(failed):
         ),
         agent_version_id="agent-1",
         provider="deepseek",
-        model_name="deepseek-chat",
+        model_name="deepseek-flash",
     )
     request = ModelRequest(
         messages=[{"role": "system", "content": "Return json. Example: {}"}],
@@ -61,7 +61,7 @@ async def test_invocation_record_keeps_provider_metadata_and_timing(failed):
         provider_request_id="req-mocked-5",
         duration_ms=42,
         provider_parameters={
-            "model": "deepseek-chat",
+            "model": "deepseek-flash",
             "response_format": {"type": "json_object"},
             "temperature": 0,
             "top_p": 0.8,

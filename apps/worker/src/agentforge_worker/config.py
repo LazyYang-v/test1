@@ -35,7 +35,7 @@ class WorkerSettings(BaseSettings):
     model_timeout_seconds: float = Field(default=60.0, gt=0)
     model_provider: str = "fake"
     deepseek_api_key: str | None = None
-    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_input_cost_per_million: float = Field(
         default=0.0, ge=0, allow_inf_nan=False
     )
@@ -81,7 +81,7 @@ class WorkerSettings(BaseSettings):
             or parsed.password
             or parsed.query
             or parsed.fragment
-            or not parsed.path.startswith("/")
+            or (parsed.path and not parsed.path.startswith("/"))
         ):
             raise ValueError("DeepSeek base URL must be a credential-free HTTPS URL")
         return value.rstrip("/")

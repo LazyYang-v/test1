@@ -9,13 +9,12 @@ from datetime import UTC, datetime
 
 import asyncpg
 import pytest
-from agentforge_core.business_dataset import write_dataset
-from agentforge_core.business_loader import load_dataset
-from httpx import ASGITransport, AsyncClient
-
 from agentforge_api.app import create_app
 from agentforge_api.auth import create_access_token
 from agentforge_api.config import Settings
+from agentforge_core.business_dataset import write_dataset
+from agentforge_core.business_loader import load_dataset
+from httpx import ASGITransport, AsyncClient
 
 pytestmark = pytest.mark.integration
 JWT_SECRET = "integration-test-signing-secret-at-least-32-bytes"
@@ -575,6 +574,16 @@ async def test_task_detail_and_list_hide_foreign_tasks_and_filter_owner(migrated
     assert detail.json()["status"] == "queued"
     assert detail.json()["current_attempt_no"] == 0
     assert detail.json()["progress"]["total_steps"] == 4
+    assert detail.json()["input"] == {
+        "question": "Explain the change in CN_EAST GMV from the previous period",
+        "region_codes": ["CN_EAST"],
+        "date_range": {
+            "start": "2025-03-31",
+            "end_exclusive": "2025-04-07",
+            "timezone": "UTC",
+        },
+        "compare_mode": "previous_period",
+    }
     assert foreign.status_code == 404
     assert foreign.json()["error"]["code"] == "TASK_NOT_FOUND"
     assert [item["task_id"] for item in listing.json()["items"]] == [task_id]
@@ -627,9 +636,13 @@ async def test_api_role_can_only_read_snapshot_metadata_and_cannot_mutate_tasks(
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute("DELETE FROM runtime.task_events WHERE false")
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await conn.execute("UPDATE registry.agent_versions SET status = 'retired' WHERE false")
+            await conn.execute(
+                "UPDATE registry.agent_versions SET agent_key = 'other' WHERE false"
+            )
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await conn.execute("INSERT INTO registry.agent_versions DEFAULT VALUES")
+            await conn.execute(
+                "INSERT INTO registry.agent_versions (created_at) VALUES (now())"
+            )
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute("SELECT runtime.require_published_task_agent()")
         assert await conn.fetchval(
@@ -905,7 +918,7 @@ async def test_in_flight_idempotency_serializes_replay_conflicts_and_expiry(
 async def test_creation_wins_retirement_lock_and_preserves_pinned_version(seeded_tasks_db):
     db = seeded_tasks_db
     observer = await asyncpg.connect(db["superuser_dsn"])
-    retirement = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    retirement = await asyncpg.connect(db["role_dsn"]("api"))
     create = retire = None
     headers = {"Authorization": f"Bearer {_token()}", "Idempotency-Key": "create-before-retire"}
     async with AsyncClient(
@@ -959,7 +972,7 @@ async def test_creation_wins_retirement_lock_and_preserves_pinned_version(seeded
 async def test_retirement_wins_lock_and_creation_rechecks_publication(seeded_tasks_db):
     db = seeded_tasks_db
     observer = await asyncpg.connect(db["superuser_dsn"])
-    retirement = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    retirement = await asyncpg.connect(db["role_dsn"]("api"))
     transaction = retirement.transaction()
     await transaction.start()
     committed = False

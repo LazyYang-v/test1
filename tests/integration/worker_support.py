@@ -5,21 +5,27 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import subprocess
+import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import asyncpg
-from agentforge_core.business_dataset import write_dataset
-from agentforge_core.business_loader import load_dataset
-from agentforge_core.schema_version import SCHEMA_VERSION  # noqa: F401
-from httpx import ASGITransport, AsyncClient, Response
-
 from agentforge_api.app import create_app
 from agentforge_api.auth import create_access_token
 from agentforge_api.config import Settings
+from agentforge_core.business_dataset import write_dataset
+from agentforge_core.business_loader import load_dataset
+from agentforge_core.schema_version import SCHEMA_VERSION  # noqa: F401
+from argon2 import PasswordHasher
+from httpx import ASGITransport, AsyncClient, Response
 
 JWT_SECRET = "integration-test-signing-secret-at-least-32-bytes"
 USER_ID = "0192a3b4-c5d6-7e8f-9012-3456789abcde"
@@ -142,10 +148,144 @@ async def seed_agent(
     return {"agent_id": agent_id, "agent_key": agent_key, "profile_id": profile_id}
 
 
+REGISTRY_OPERATOR_ID = "00000000-0000-7000-8000-000000000404"
+REGISTRY_OPERATOR_EMAIL = "registry-operator@example.com"
+REGISTRY_OPERATOR_PASSWORD = "integration-operator-password"
+
+
+async def _seed_registry_operator(db: dict) -> None:
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO identity.users "
+            "(id, email, password_hash, display_name, status, token_version) "
+            "VALUES ($1::uuid, $2, $3, 'Registry Operator', 'active', 1)",
+            REGISTRY_OPERATOR_ID,
+            REGISTRY_OPERATOR_EMAIL,
+            PasswordHasher().hash(REGISTRY_OPERATOR_PASSWORD),
+        )
+        await conn.executemany(
+            "INSERT INTO identity.operator_permissions (user_id, permission) "
+            "VALUES ($1::uuid, $2)",
+            [
+                (REGISTRY_OPERATOR_ID, "identity_admin"),
+                (REGISTRY_OPERATOR_ID, "registry_operator"),
+            ],
+        )
+    finally:
+        await conn.close()
+
+
+def registry_cli_context(db: dict) -> tuple[str, str]:
+    """Start an isolated API and obtain a real login token for Registry CLI tests."""
+    existing = db.get("_registry_cli_context")
+    if existing is not None:
+        return existing["api_url"], existing["access_token"]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(asyncio.run, _seed_registry_operator(db)).result()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    api_url = f"http://127.0.0.1:{port}"
+    log_file = tempfile.NamedTemporaryFile(
+        mode="w+", prefix="agentforge-registry-api-", suffix=".log", delete=False
+    )
+    env = os.environ.copy()
+    env["AGENTFORGE_API_DB_DSN"] = db["role_dsn"]("api")
+    env["AGENTFORGE_JWT_SECRET"] = JWT_SECRET
+    env["AGENTFORGE_OTEL_ENABLED"] = "false"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "agentforge_api.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--no-access-log",
+        ],
+        cwd=db["repo_root"],
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    context = {
+        "api_url": api_url,
+        "access_token": "",
+        "process": process,
+        "log_file": log_file,
+        "log_path": log_file.name,
+    }
+
+    def cleanup() -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        log_file.close()
+        Path(log_file.name).unlink(missing_ok=True)
+
+    db["_registry_cli_context"] = context
+    db["_registry_cli_cleanup"] = cleanup
+    try:
+        for _ in range(300):
+            if process.poll() is not None:
+                log_file.flush()
+                raise RuntimeError(
+                    f"Registry API test server exited: {Path(log_file.name).read_text()}"
+                )
+            try:
+                with urllib.request.urlopen(f"{api_url}/health/ready", timeout=1):
+                    break
+            except urllib.error.URLError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Registry API test server did not become ready")
+
+        login_body = json.dumps(
+            {
+                "email": REGISTRY_OPERATOR_EMAIL,
+                "password": REGISTRY_OPERATOR_PASSWORD,
+            }
+        ).encode("utf-8")
+        login_request = urllib.request.Request(
+            f"{api_url}/api/v1/auth/login",
+            data=login_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(login_request, timeout=5) as response:
+            context["access_token"] = json.loads(response.read())["access_token"]
+    except Exception:
+        cleanup()
+        db.pop("_registry_cli_context", None)
+        db.pop("_registry_cli_cleanup", None)
+        raise
+    return api_url, context["access_token"]
+
+
+def cleanup_registry_cli_context(db: dict) -> None:
+    cleanup = db.pop("_registry_cli_cleanup", None)
+    db.pop("_registry_cli_context", None)
+    if cleanup is not None:
+        cleanup()
+
 def registry_cli(db: dict, *args: str) -> dict[str, Any]:
-    """Run the real Registry CLI, which freezes the profile into a snapshot."""
+    """Run the real Registry CLI against an isolated authenticated API."""
+    api_url, access_token = registry_cli_context(db)
     env = os.environ.copy()
     env["AGENTFORGE_REGISTRY_DSN"] = db["role_dsn"]("registry_cli")
+    env["AGENTFORGE_API_URL"] = api_url
+    env["AGENTFORGE_ACCESS_TOKEN"] = access_token
     executable = db["repo_root"] / ".venv" / "bin" / "agentforge-registry"
     process = subprocess.run(
         [str(executable), *args],

@@ -1,11 +1,10 @@
 """Deterministic fixed benchmark assertions against runtime report payloads."""
 
 import pytest
-from pydantic import ValidationError
-
 from agentforge_api.config import Settings
 from agentforge_api.evaluations import CreateEvaluationRun
 from agentforge_core.evaluation import CORE_CASES, SNAPSHOT_ID, evaluate_case
+from pydantic import ValidationError
 
 
 def _report(case, *, current_value, previous_value, absolute_change, change_rate, evidence_id):
@@ -46,6 +45,7 @@ def _evaluate(case, *, report=None, actual=None, evidence_plan=None, snapshot=SN
         "evidence_id": evidence_id,
         "task_id": task_id,
         "data_snapshot_id": snapshot,
+        "row_count": case["assertions"].get("expected_row_count", 1),
         "query_plan_json": evidence_plan
         or {
             "regions": case["input"]["region_codes"],
@@ -125,10 +125,6 @@ def test_benchmark_checks_all_ten_numeric_and_structural_cases():
         report["metrics"][0].update(
             {field: value for field, value in expected.items() if field in report["metrics"][0]}
         )
-        if "row_count" in expected:
-            report["metrics"][0]["row_count"] = expected["row_count"]
-        if "expected_row_count" in case["assertions"]:
-            report["metrics"][0]["row_count"] = case["assertions"]["expected_row_count"]
         if case["case_key"] == "BA-03":
             report["limitations"] = ["ZERO_BASELINE"]
         if case["case_key"] == "BA-04":

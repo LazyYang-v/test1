@@ -1,9 +1,9 @@
 # AgentForge P0 — Runbook
 
 Audience: operators running, observing, and troubleshooting a P0 deployment.
-Everything here is verified against the code at `integration/p0`; items that
-require an environment this repository's sandbox cannot provide are marked
-explicitly.
+Runbook instructions are verified against repository code. The isolated
+integration suite uses Docker-backed PostgreSQL; this runbook does not claim a
+Compose deployment, live model call, or external trace-export run.
 
 ## 1. Cold start (required services)
 
@@ -60,6 +60,14 @@ nothing.
 - Migrations are ordered, ledgered, and idempotent to re-run (`up to date`).
   The API refuses readiness when the ledger version mismatches, so a
   half-migrated database never serves traffic.
+- The migration ledger is the only supported recovery record. Re-running the
+  migrator on an intact ledger must be a no-op; a missing, renamed, or
+  checksum-tampered migration entry must fail closed. Manually clearing
+  `agentforge.schema_migrations` to force a replay of historical migration
+  SQL is **not** a supported recovery procedure and is forbidden: shipped
+  migrations are not required to be raw-SQL replayable. A corrupted or wiped
+  ledger must go through manual reconciliation and recovery; it must never
+  be "repaired" by replay.
 - The frozen dataset is deterministic: same generator version, seed, hash
   algorithm, and ordering always produce the same `data_snapshot_id`
   (`e38d3afb175b4d130db4e1600cef8710b448bd67151770f1ca6ad6734e0ab5b8`).
@@ -68,6 +76,29 @@ nothing.
   `agentforge_api`, `agentforge_worker`, `agentforge_business_ro`,
   `agentforge_eval`. The business read path uses `agentforge_business_ro`,
   which has no write privilege on business tables.
+
+### Backup and migration failure recovery
+
+Before applying migration 0013, make and verify a custom-format backup. Keep
+the backup outside the database volume and restrict its permissions:
+
+```sh
+umask 077
+backup_file="agentforge-before-0013-$(date +%Y%m%d%H%M%S).dump"
+docker compose exec -T postgres sh -ec 'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --host=127.0.0.1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --format=custom' > "$backup_file"
+pg_restore --list "$backup_file" >/dev/null
+```
+
+Each migration and its ledger entry run in one transaction. If migration 0013
+fails, PostgreSQL rolls back that migration; preserve the database volume and
+inspect `docker compose logs migrate`. Do not clear or edit
+`agentforge.schema_migrations`, replay historical SQL, or run `docker compose
+down -v`. Fix the deployment cause, rerun the migrator, and confirm
+`GET /health/ready` reports the expected schema version before serving traffic.
+For recovery, initialize a separate PostgreSQL 17 instance with this repository's
+PostgreSQL init script and matching role credentials, restore the verified dump,
+and validate its ledger and application readiness before a controlled cutover.
+Keep the failed database intact until the cutover succeeds.
 
 ## 4. Test tiers
 
@@ -184,3 +215,59 @@ them until executed:
 - The semantic layer is the only data path: model output is a metric query
   plan, compiled to parameterized read-only SQL with platform-injected region
   filters. There is no free-SQL path to the business tables.
+
+## 9. Bootstrap, identity, and Registry administration
+
+### First Operator
+
+After migration and seed complete, issue the one-time 15-minute Bootstrap
+secret from an interactive terminal. The CLI connects with the migrator DSN,
+stores only a digest, and refuses to print secrets when stdout is redirected:
+
+```sh
+docker compose run --rm -it migrate \
+  /app/.venv/bin/agentforge-bootstrap-secret issue-bootstrap
+```
+
+Use the secret once with `POST /api/v1/bootstrap`, then log in through
+`POST /api/v1/auth/login`. The new Operator has `identity_admin` and
+`registry_operator`; the password must contain at least 12 characters. Do not
+put the secret in shell history, logs, or a ticket.
+
+### Business users and Registry writes
+
+Create an analyst through `POST /api/v1/admin/identity/users` with the active
+Operator token. The endpoint creates an ACTIVE user with only `CN_EAST/read`;
+it does not grant Operator access. Region authorization is checked against the
+live grant table on task creation and tool execution.
+
+Registry writes use the authenticated API. For local CLI writes, set the API
+URL and an Operator bearer token in the current shell, then run
+`uv run agentforge-registry ...`. The Registry database role is read-only;
+there is no supported direct-DML write path. See `docs/api.md` for the profile,
+tool, Agent draft, binding, publish, and retire request contracts.
+
+### Disable and restore an Operator
+
+An active Operator with `identity_admin` can disable another Operator at
+`POST /api/v1/admin/identity/operators/{user_id}/disable`. This increments the
+target's token version and invalidates existing sessions. For a locked-out
+account, a trusted host operator can issue a secret scoped to that account and
+action:
+
+```sh
+docker compose run --rm -it migrate \
+  /app/.venv/bin/agentforge-bootstrap-secret issue-recovery \
+  --action disable --user-id <operator-uuid>
+```
+
+Send the printed secret once to `POST /api/v1/operator-recovery` with no
+`new_password` to disable the target. To restore the disabled Operator, issue
+a new secret with `--action restore --user-id <operator-uuid> --rotate`, then
+send it with a new password of at least 12 characters. `--rotate` is required
+when replacing a consumed or still-live recovery secret. Both commands require
+an interactive terminal; recovery secrets expire after 15 minutes and are
+single-use. Re-login after restoration because old tokens remain invalid.
+
+Bootstrap, recovery issuance/rotation, denied attempts, and Operator state
+changes are audited without storing secret values or passwords.

@@ -9,11 +9,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
+from agentforge_core.faults import NOOP_FAULT_INJECTOR
+from agentforge_core.observability import span
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agentforge_api.auth import (
     ApiError,
@@ -24,16 +26,16 @@ from agentforge_api.auth import (
 )
 from agentforge_api.config import Settings
 from agentforge_api.evaluations import router as evaluation_router
-from agentforge_core.faults import NOOP_FAULT_INJECTOR
-from agentforge_api.readiness import check_database_readiness
+from agentforge_api.identity_admin import router as identity_admin_router
 from agentforge_api.observability import (
     configure_json_logging,
     configure_telemetry,
     log_event,
 )
 from agentforge_api.rate_limit import StreamConcurrencyLimiter, TokenBucketLimiter
+from agentforge_api.readiness import check_database_readiness
+from agentforge_api.registry_admin import router as registry_admin_router
 from agentforge_api.tasks import router as task_router
-from agentforge_core.observability import span
 
 logger = logging.getLogger("agentforge.api")
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -149,6 +151,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="AgentForge API", lifespan=lifespan)
     app.include_router(task_router)
+    app.include_router(identity_admin_router)
+    app.include_router(registry_admin_router)
     app.include_router(evaluation_router)
     # Fault hooks are an optional deterministic test seam, inert in production.
     app.state.fault_injector = NOOP_FAULT_INJECTOR
@@ -322,11 +326,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 """,
                 principal["id"],
             )
+            operator_permissions = await conn.fetch(
+                "SELECT permission FROM identity.operator_permissions "
+                "WHERE user_id = $1::uuid ORDER BY permission",
+                principal["id"],
+            )
         return {
             "id": principal["id"],
             "email": principal["email"],
             "display_name": principal["display_name"],
             "regions": [dict(grant) for grant in grants],
+            "operator_permissions": [item["permission"] for item in operator_permissions],
         }
 
     @app.get("/api/v1/regions/{region_code}/access")

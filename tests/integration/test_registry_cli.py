@@ -7,15 +7,12 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 
 import asyncpg
 import pytest
-
 from agentforge_core.migrations import apply_migrations
-
+from worker_support import registry_cli_context
 
 pytestmark = pytest.mark.integration
 ACTOR_ID = "00000000-0000-7000-8000-000000000404"
@@ -24,6 +21,18 @@ ACTOR_ID = "00000000-0000-7000-8000-000000000404"
 def _cli(migrated_db, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["AGENTFORGE_REGISTRY_DSN"] = migrated_db["role_dsn"]("registry_cli")
+    is_write = bool(args) and (
+        (args[0] == "model-profile" and args[1:2] == ("register",))
+        or (args[0] == "tool" and args[1:2] == ("register",))
+        or (
+            args[0] == "agent"
+            and args[1:2] in {("create",), ("bind-tool",), ("publish",), ("retire",)}
+        )
+    )
+    if is_write:
+        api_url, access_token = registry_cli_context(migrated_db)
+        env["AGENTFORGE_API_URL"] = api_url
+        env["AGENTFORGE_ACCESS_TOKEN"] = access_token
     executable = migrated_db["repo_root"] / ".venv" / "bin" / "agentforge-registry"
     process = subprocess.run(
         [str(executable), *args],
@@ -114,6 +123,103 @@ def _tool(migrated_db, policy: dict, *, tool_key: str = "policy-tool") -> dict:
     )
 
 
+async def _legacy_profile(db: dict, profile_key: str) -> dict:
+    profile_id = str(uuid.uuid4())
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO registry.model_profiles "
+            "(id, profile_key, provider, model_name, endpoint_alias, credential_ref, "
+            "timeout_ms, max_output_tokens, config_json) "
+            "VALUES ($1::uuid, $2, 'fake', 'fake-v1', 'fake-local', "
+            "'secret://agentforge/test/fake-provider', 2500, 768, '{\"temperature\":0.2}'::jsonb)",
+            profile_id,
+            profile_key,
+        )
+    finally:
+        await conn.close()
+    return {"id": profile_id}
+
+
+async def _legacy_draft(
+    db: dict, profile_id: str, *, agent_key: str = "sales-report"
+) -> dict:
+    agent_id = str(uuid.uuid4())
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO registry.agent_versions "
+            "(id, agent_key, version, name, graph_key, model_profile_id, "
+            "config_json, config_hash, status) "
+            "VALUES ($1::uuid, $2, '1.0.0', 'Sales report', 'metrics-v1', "
+            "$3::uuid, '{\"max_tool_calls\":4}'::jsonb, $4, 'draft')",
+            agent_id,
+            agent_key,
+            profile_id,
+            "a" * 64,
+        )
+    finally:
+        await conn.close()
+    return {"id": agent_id}
+
+
+async def _legacy_tool(db: dict, policy: dict) -> dict:
+    tool_id = str(uuid.uuid4())
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO registry.tool_versions "
+            "(id, tool_key, version, input_schema, output_schema, policy_json, "
+            "execution_kind, timeout_ms) "
+            "VALUES ($1::uuid, 'policy-tool', '1', '{\"type\":\"object\"}'::jsonb, "
+            "'{\"type\":\"object\"}'::jsonb, $2::jsonb, 'internal', 1000)",
+            tool_id,
+            json.dumps(policy),
+        )
+    finally:
+        await conn.close()
+    return {"id": tool_id}
+
+
+async def _legacy_bind(db: dict, draft: dict, tool: dict, override: dict) -> None:
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "INSERT INTO registry.agent_tool_bindings "
+            "(agent_version_id, tool_version_id, policy_override) "
+            "VALUES ($1::uuid, $2::uuid, $3::jsonb)",
+            draft["id"],
+            tool["id"],
+            json.dumps(override),
+        )
+    finally:
+        await conn.close()
+
+
+async def _legacy_publish(db: dict, draft: dict) -> dict:
+    conn = await asyncpg.connect(db["role_dsn"]("migrator"))
+    try:
+        await conn.execute(
+            "UPDATE registry.agent_versions SET status = 'published', "
+            "model_config_snapshot = '{\"provider\":\"fake\"}'::jsonb, "
+            "config_hash = $2, published_at = now() WHERE id = $1::uuid",
+            draft["id"],
+            "b" * 64,
+        )
+        row = await conn.fetchrow(
+            "SELECT config_hash, model_config_snapshot, published_at "
+            "FROM registry.agent_versions WHERE id = $1::uuid",
+            draft["id"],
+        )
+        result = dict(row)
+        if isinstance(result["model_config_snapshot"], str):
+            result["model_config_snapshot"] = json.loads(result["model_config_snapshot"])
+        result["published_at"] = result["published_at"].isoformat()
+        return result
+    finally:
+        await conn.close()
+
+
 def _publish(migrated_db, version_id: str) -> dict:
     return _result(
         _cli(
@@ -122,17 +228,15 @@ def _publish(migrated_db, version_id: str) -> dict:
             "publish",
             "--version-id",
             version_id,
-            "--actor-id",
-            ACTOR_ID,
         )
     )
 
 
-async def test_registry_migration_is_present_in_schema_version_seven(migrated_db):
+async def test_registry_migration_0013_revokes_registry_cli_write_privileges(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
-        registry_migration_applied = await conn.fetchval(
-            "SELECT count(*) = 2 FROM agentforge.schema_migrations WHERE version IN (4, 7)"
+        registry_migrations_applied = await conn.fetchval(
+            "SELECT count(*) = 3 FROM agentforge.schema_migrations WHERE version IN (4, 7, 13)"
         )
         registry_tables = await conn.fetch(
             """
@@ -168,7 +272,7 @@ async def test_registry_migration_is_present_in_schema_version_seven(migrated_db
     finally:
         await conn.close()
 
-    assert registry_migration_applied is True
+    assert registry_migrations_applied is True
     assert {row["table_name"] for row in registry_tables} == {
         "model_profiles",
         "agent_versions",
@@ -182,7 +286,7 @@ async def test_registry_migration_is_present_in_schema_version_seven(migrated_db
         False,
         True,
         False,
-        True,
+        False,
         True,
     )
     conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
@@ -205,9 +309,11 @@ async def test_registry_migration_is_present_in_schema_version_seven(migrated_db
             "registry.agent_tool_bindings",
         ):
             assert await conn.fetchval(
-                "SELECT has_table_privilege(current_user, $1, 'SELECT,INSERT,UPDATE,DELETE')",
-                table,
+                "SELECT has_table_privilege(current_user, $1, 'SELECT')", table
             ) is True
+            assert await conn.fetchval(
+                "SELECT has_table_privilege(current_user, $1, 'INSERT,UPDATE,DELETE')", table
+            ) is False
     finally:
         await conn.close()
 
@@ -258,7 +364,7 @@ async def test_publish_freezes_the_current_model_profile_and_audits_lifecycle(mi
     validated = _result(_cli(migrated_db, "agent", "validate", "--version-id", draft["id"]))
     assert validated["valid"] is True
 
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
             "UPDATE registry.model_profiles SET model_name = 'fake-v2', timeout_ms = 4200 "
@@ -290,8 +396,6 @@ async def test_publish_freezes_the_current_model_profile_and_audits_lifecycle(mi
             "retire",
             "--version-id",
             draft["id"],
-            "--actor-id",
-            ACTOR_ID,
         )
     )
     assert retired["status"] == "retired"
@@ -321,10 +425,11 @@ async def test_publish_freezes_the_current_model_profile_and_audits_lifecycle(mi
         await conn.close()
 
     assert [(row["action"], row["decision"]) for row in events] == [
+        ("registry.agent_version.created", "allowed"),
         ("agent.version.published", "allowed"),
         ("agent.version.retired", "allowed"),
     ]
-    assert all(row["actor_type"] == "cli" for row in events)
+    assert all(row["actor_type"] == "user" for row in events)
     assert all(row["actor_id"] == ACTOR_ID for row in events)
     assert all(row["occurred_at"] is not None for row in events)
 
@@ -354,7 +459,7 @@ async def test_published_configuration_cannot_be_changed_by_registry_cli(migrate
             "UPDATE registry.agent_versions SET config_hash = repeat('0', 64) WHERE id = $1::uuid",
         ]
         for statement in attempted_updates:
-            with pytest.raises(asyncpg.PostgresError, match="published agent versions are immutable"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await conn.execute(statement, draft["id"])
     finally:
         await conn.close()
@@ -419,7 +524,7 @@ async def test_tool_policy_override_may_only_tighten_and_published_bindings_free
         "require_approval": True,
     }
 
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         with pytest.raises(asyncpg.PostgresError, match="tool version configuration is immutable"):
             await conn.execute(
@@ -430,7 +535,7 @@ async def test_tool_policy_override_may_only_tighten_and_published_bindings_free
         await conn.close()
 
     _publish(migrated_db, draft["id"])
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         with pytest.raises(asyncpg.PostgresError, match="published agent bindings are immutable"):
             await conn.execute(
@@ -566,7 +671,7 @@ async def test_external_binding_rejects_invalid_policy_override(
     _profile(migrated_db, "invalid-policy")
     draft = _draft(migrated_db, "invalid-policy")
     tool = _tool(migrated_db, base_policy)
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         if operation == "update":
             await conn.execute(
@@ -646,8 +751,6 @@ async def test_cli_rejects_legacy_invalid_policy_override(
     await _legacy_binding(migrated_db, draft, tool, override)
 
     args = ["agent", command, "--version-id", draft["id"]]
-    if command == "publish":
-        args.extend(["--actor-id", ACTOR_ID])
     rejected = _cli(migrated_db, *args, check=False)
     assert rejected.returncode == 1
     if command == "validate":
@@ -677,7 +780,7 @@ async def test_external_publication_rejects_legacy_invalid_policy_binding(
     tool = _tool(migrated_db, base_policy)
     await _legacy_binding(migrated_db, draft, tool, override)
 
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         with pytest.raises(asyncpg.CheckViolationError, match="only tighten"):
             await conn.execute(
@@ -703,13 +806,15 @@ async def test_policy_migration_rejects_existing_invalid_bindings_without_changi
     dsn = unmigrated_db["role_dsn"]("migrator")
     await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
     legacy_db = {**migrated_db, **unmigrated_db}
-    _profile(legacy_db, "upgrade-profile")
-    draft = _draft(legacy_db, "upgrade-profile")
+    profile = await _legacy_profile(legacy_db, "upgrade-profile")
+    draft = await _legacy_draft(legacy_db, profile["id"])
     if case == "missing-base":
-        tool = _tool(legacy_db, {})
+        tool = await _legacy_tool(legacy_db, {})
         override = {"max_calls": 4}
     else:
-        tool = _tool(legacy_db, {"allowed_routes": [{"region": "east", "mode": "read"}]})
+        tool = await _legacy_tool(
+            legacy_db, {"allowed_routes": [{"region": "east", "mode": "read"}]}
+        )
         override = {"allowed_routes": [{"region": "east"}]}
 
     conn = await asyncpg.connect(legacy_db["role_dsn"]("registry_cli"))
@@ -779,21 +884,18 @@ async def test_policy_migration_preserves_valid_published_bindings(
     dsn = unmigrated_db["role_dsn"]("migrator")
     await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
     legacy_db = {**migrated_db, **unmigrated_db}
-    _profile(legacy_db, "valid-upgrade")
-    draft = _draft(legacy_db, "valid-upgrade")
-    tool = _tool(legacy_db, {"max_calls": 5, "allowed_routes": [{"region": "east", "mode": "read"}]})
-    _cli(
+    profile = await _legacy_profile(legacy_db, "valid-upgrade")
+    draft = await _legacy_draft(legacy_db, profile["id"])
+    tool = await _legacy_tool(
         legacy_db,
-        "agent",
-        "bind-tool",
-        "--version-id",
-        draft["id"],
-        "--tool-id",
-        tool["id"],
-        "--policy-override-json",
-        '{"max_calls":3,"allowed_routes":[{"region":"east","mode":"read"}]}',
+        {"max_calls": 5, "allowed_routes": [{"region": "east", "mode": "read"}]},
     )
-    before = _publish(legacy_db, draft["id"])
+    override = {
+        "max_calls": 3,
+        "allowed_routes": [{"region": "east", "mode": "read"}],
+    }
+    await _legacy_bind(legacy_db, draft, tool, override)
+    before = await _legacy_publish(legacy_db, draft)
     migration = versions / "0007_registry_policy_validation.sql"
     shutil.copyfile(migration, tmp_path / migration.name)
     await apply_migrations(dsn, tmp_path, migrated_db["migrate_env"])
@@ -832,7 +934,7 @@ async def test_external_registry_version_identifier_is_immutable(migrated_db, re
         table = "tool_versions"
         update = "id = $2::uuid"
 
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         with pytest.raises(asyncpg.CheckViolationError, match="identifiers are immutable"):
             await conn.execute(
@@ -849,7 +951,7 @@ async def test_external_registry_version_identifier_is_immutable(migrated_db, re
 
 async def test_registry_rejects_embedded_model_credentials(migrated_db):
     profile = _profile(migrated_db, "credential-guard")
-    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         with pytest.raises(asyncpg.CheckViolationError, match="must use credential references"):
             await conn.execute(
@@ -857,6 +959,10 @@ async def test_registry_rejects_embedded_model_credentials(migrated_db):
                 "WHERE id = $1::uuid",
                 profile["id"],
             )
+    finally:
+        await conn.close()
+    conn = await asyncpg.connect(migrated_db["role_dsn"]("registry_cli"))
+    try:
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.fetchval(
                 "SELECT registry.jsonb_has_embedded_credential('{\"api_key\":\"raw\"}'::jsonb)"
@@ -888,6 +994,36 @@ async def test_registry_rejects_embedded_model_credentials(migrated_db):
     )
     assert completed.returncode != 0
     assert "credential" in completed.stderr.lower() or "secret" in completed.stderr.lower()
+
+
+async def test_registry_rejects_raw_credential_reference(migrated_db):
+    raw_credential = "raw-provider-token-must-not-persist"
+    completed = _cli(
+        migrated_db,
+        "model-profile",
+        "register",
+        "--profile-key",
+        "unsafe-credential-ref",
+        "--provider",
+        "fake",
+        "--model-name",
+        "fake-v1",
+        "--endpoint-alias",
+        "fake-local",
+        "--credential-ref",
+        raw_credential,
+        "--timeout-ms",
+        "1000",
+        "--max-output-tokens",
+        "256",
+        "--config-json",
+        "{}",
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "INVALID_REQUEST" in completed.stderr
+    assert raw_credential not in completed.stderr
 
 
 @pytest.mark.parametrize("first_operation", ["bind", "publish"])
@@ -999,13 +1135,13 @@ async def test_publish_waits_for_binding_and_freezes_it(migrated_db):
 
 async def test_binding_waits_for_publish_then_is_rejected(migrated_db):
     draft, tool = await _prepare_binding_race(migrated_db, "publish-first")
-    dsn = migrated_db["role_dsn"]("registry_cli")
+    dsn = migrated_db["role_dsn"]("migrator")
     blocker = await asyncpg.connect(dsn)
     binder = await asyncpg.connect(
-        migrated_db["role_dsn"]("registry_cli"),
+        dsn,
         server_settings={"application_name": "registry-race-bind-after-publish"},
     )
-    monitor = await asyncpg.connect(dsn)
+    monitor = await asyncpg.connect(migrated_db["superuser_dsn"])
     publish_future = asyncio.create_task(asyncio.to_thread(_publish, migrated_db, draft["id"]))
     bind_task = None
     try:
@@ -1017,7 +1153,7 @@ async def test_binding_waits_for_publish_then_is_rejected(migrated_db):
             await _wait_for_locked_query(
                 monitor,
                 "FROM registry.agent_versions WHERE id = $1 FOR UPDATE",
-                "agentforge_registry_cli",
+                "agentforge_api",
             )
             bind_task = asyncio.create_task(
                 binder.execute(
@@ -1031,7 +1167,7 @@ async def test_binding_waits_for_publish_then_is_rejected(migrated_db):
             await _wait_for_locked_query(
                 monitor,
                 "INSERT INTO registry.agent_tool_bindings",
-                "agentforge_registry_cli",
+                "agentforge_migrator",
             )
 
         published = await publish_future

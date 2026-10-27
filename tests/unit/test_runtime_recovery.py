@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal, InvalidOperation
 
 import pytest
 
@@ -83,16 +84,22 @@ def test_confirmed_tool_step_must_match_its_durable_invocation_and_evidence():
     assert "tool result" in diagnostic or "evidence" in diagnostic
 
 
-def test_valid_confirmed_tool_result_matches_invocation_and_snapshot_evidence():
+def _valid_tool_recovery_records(
+    *,
+    tool_current_value: str = "57400.00",
+    evidence_current_value=Decimal("57400.00"),
+    tool_change_rate: str | None = "-0.1800",
+    evidence_change_rate=Decimal("-0.18000000"),
+) -> tuple[list[dict], list[dict], list[dict]]:
     plan = {"metric": "gmv", "metric_version": 1}
     tool_result = {
         "metric": "gmv",
         "metric_version": 1,
         "unit": "CNY",
-        "current_value": "57400.00",
+        "current_value": tool_current_value,
         "previous_value": "70000.00",
         "absolute_change": "-12600.00",
-        "change_rate": "-0.1800",
+        "change_rate": tool_change_rate,
         "row_count": 1400,
         "data_snapshot_id": "snapshot-1",
     }
@@ -116,10 +123,10 @@ def test_valid_confirmed_tool_result_matches_invocation_and_snapshot_evidence():
         "evidence_metric_key": "gmv",
         "evidence_metric_version": 1,
         "evidence_unit": "CNY",
-        "evidence_current_value": "57400.00",
-        "evidence_previous_value": "70000.00",
-        "evidence_absolute_change": "-12600.00",
-        "evidence_change_rate": "-0.1800",
+        "evidence_current_value": evidence_current_value,
+        "evidence_previous_value": Decimal("70000.00"),
+        "evidence_absolute_change": Decimal("-12600.00"),
+        "evidence_change_rate": evidence_change_rate,
         "evidence_row_count": 1400,
         "evidence_snapshot_id": "snapshot-1",
         "evidence_invocation_id": invocation_id,
@@ -133,14 +140,89 @@ def test_valid_confirmed_tool_result_matches_invocation_and_snapshot_evidence():
         "metric_key": "gmv",
         "metric_version": 1,
         "unit": "CNY",
-        "current_value": "57400.00",
-        "previous_value": "70000.00",
-        "absolute_change": "-12600.00",
-        "change_rate": "-0.1800",
+        "current_value": evidence_current_value,
+        "previous_value": Decimal("70000.00"),
+        "absolute_change": Decimal("-12600.00"),
+        "change_rate": evidence_change_rate,
         "row_count": 1400,
         "result_json": tool_result,
         "result_hash": persisted_hash,
     }]
+    return steps, invocations, evidences
+
+
+def test_valid_confirmed_tool_result_normalizes_decimal_evidence_to_json_precision():
+    steps, invocations, evidences = _valid_tool_recovery_records()
+
+    assert validate_recovery_records(
+        steps, invocations, evidences, data_snapshot_id="snapshot-1"
+    ) is None
+
+
+def test_confirmed_tool_result_with_different_numeric_evidence_fails_closed():
+    steps, invocations, evidences = _valid_tool_recovery_records(
+        evidence_current_value=Decimal("57400.01")
+    )
+
+    diagnostic = validate_recovery_records(
+        steps, invocations, evidences, data_snapshot_id="snapshot-1"
+    )
+
+    assert diagnostic == "confirmed tool result does not match evidence current_value"
+
+
+def test_non_finite_evidence_number_fails_closed_even_when_json_matches():
+    steps, invocations, evidences = _valid_tool_recovery_records(
+        tool_current_value="NaN",
+        evidence_current_value=Decimal("NaN"),
+    )
+
+    diagnostic = validate_recovery_records(
+        steps, invocations, evidences, data_snapshot_id="snapshot-1"
+    )
+
+    assert diagnostic == "confirmed tool evidence current_value is not finite"
+
+
+def test_unparseable_evidence_number_is_not_swallowed():
+    steps, invocations, evidences = _valid_tool_recovery_records(
+        tool_current_value="not-a-number",
+        evidence_current_value="not-a-number",
+    )
+
+    with pytest.raises(InvalidOperation):
+        validate_recovery_records(
+            steps, invocations, evidences, data_snapshot_id="snapshot-1"
+        )
+
+
+@pytest.mark.parametrize(
+    ("tool_change_rate", "evidence_change_rate"),
+    [
+        ("-0.1800", None),
+        (None, Decimal("-0.18000000")),
+    ],
+)
+def test_change_rate_none_and_numeric_mismatch_fails_closed(
+    tool_change_rate, evidence_change_rate
+):
+    steps, invocations, evidences = _valid_tool_recovery_records(
+        tool_change_rate=tool_change_rate,
+        evidence_change_rate=evidence_change_rate,
+    )
+
+    diagnostic = validate_recovery_records(
+        steps, invocations, evidences, data_snapshot_id="snapshot-1"
+    )
+
+    assert diagnostic == "confirmed tool result does not match evidence change_rate"
+
+
+def test_none_change_rate_matches_none_evidence_rate():
+    steps, invocations, evidences = _valid_tool_recovery_records(
+        tool_change_rate=None,
+        evidence_change_rate=None,
+    )
 
     assert validate_recovery_records(
         steps, invocations, evidences, data_snapshot_id="snapshot-1"

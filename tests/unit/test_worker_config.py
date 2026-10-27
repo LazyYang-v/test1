@@ -51,7 +51,7 @@ def test_model_provider_configuration_defaults_to_fake_without_credentials():
 
     assert settings.model_provider == "fake"
     assert settings.deepseek_api_key is None
-    assert settings.deepseek_base_url == "https://api.deepseek.com/v1"
+    assert settings.deepseek_base_url == "https://api.deepseek.com"
     assert settings.deepseek_input_cost_per_million == 0
     assert settings.deepseek_output_cost_per_million == 0
 
@@ -67,6 +67,16 @@ def test_model_provider_must_be_supported_and_deepseek_key_is_explicit():
 
     with pytest.raises(ValidationError):
         WorkerSettings(worker_db_dsn=WORKER_DSN, model_provider="unknown")
+
+
+def test_deepseek_environment_variables_are_loaded_by_worker_settings(monkeypatch):
+    monkeypatch.setenv("AGENTFORGE_MODEL_PROVIDER", "deepseek")
+    monkeypatch.setenv("AGENTFORGE_DEEPSEEK_API_KEY", "unit-test-key")
+
+    settings = WorkerSettings(worker_db_dsn=WORKER_DSN)
+
+    assert settings.model_provider == "deepseek"
+    assert settings.deepseek_api_key == "unit-test-key"
 
 
 def test_deepseek_token_costs_must_be_non_negative_and_finite():

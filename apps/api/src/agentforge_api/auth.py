@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,13 +10,13 @@ from typing import Any
 import anyio
 import asyncpg
 import jwt
+from agentforge_core.observability import log_event
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from agentforge_api.rate_limit import TokenBucketLimiter
-from agentforge_core.observability import log_event
 
 logger = logging.getLogger("agentforge.api")
 
@@ -74,6 +73,58 @@ async def verify_password(password: str, password_hash: str | None) -> bool:
         return await anyio.to_thread.run_sync(_PASSWORDS.verify, candidate_hash, password)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
+
+
+async def hash_password(password: str) -> str:
+    """Hash a new password with the same Argon2id settings used for login."""
+    return await anyio.to_thread.run_sync(_PASSWORDS.hash, password)
+
+
+async def operator_permission_allowed(
+    conn: asyncpg.Connection,
+    request: Request,
+    principal: dict[str, Any],
+    permission: str,
+) -> bool:
+    """Check a live Operator permission while holding a shared user-row lock."""
+    if permission not in {"identity_admin", "registry_operator"}:
+        raise ValueError("unknown Operator permission")
+    user = await conn.fetchrow(
+        """
+        SELECT users.status, users.token_version,
+               EXISTS (
+                   SELECT 1 FROM identity.operator_permissions AS permissions
+                   WHERE permissions.user_id = users.id
+                     AND permissions.permission = $2
+               ) AS permitted
+        FROM identity.users AS users
+        WHERE users.id = $1::uuid
+        FOR SHARE OF users
+        """,
+        principal["id"],
+        permission,
+    )
+    allowed = bool(
+        user is not None
+        and user["status"] == "active"
+        and user["token_version"] == principal["token_version"]
+        and user["permitted"]
+    )
+    if not allowed:
+        await conn.execute(
+            """
+            INSERT INTO audit.audit_events
+                (actor_type, actor_id, action, resource_type, resource_id,
+                 decision, reason_code, metadata_json, trace_id)
+            VALUES ('user', $1::uuid, 'operator.authorization', 'operator_permission',
+                    $2, 'denied', 'OPERATOR_PERMISSION_REQUIRED',
+                    jsonb_build_object('permission', $2::text), $3)
+            """,
+            principal["id"],
+            permission,
+            request.state.request_id,
+        )
+    return allowed
 
 
 async def log_auth_failure(

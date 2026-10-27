@@ -282,7 +282,7 @@ class DeepSeekModel:
         *,
         model_name: str,
         api_key: str,
-        base_url: str = "https://api.deepseek.com/v1",
+        base_url: str = "https://api.deepseek.com",
         client: httpx.AsyncClient | None = None,
         input_cost_per_million: Decimal = Decimal("0"),
         output_cost_per_million: Decimal = Decimal("0"),

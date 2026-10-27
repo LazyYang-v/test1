@@ -907,7 +907,7 @@ async def get_task(
             """
             SELECT task.id::text AS task_id, task.task_type, task.status,
                    task.version, task.current_attempt_no, task.result_json,
-                   task.region_scope_json,
+                   task.input_json, task.region_scope_json,
                    task.error_code, task.error_message, task.created_at,
                    NOT EXISTS (
                        SELECT 1
@@ -968,6 +968,7 @@ async def get_task(
         "version": result["version"],
         "current_attempt_no": result["current_attempt_no"],
         "progress": {"current_step": None, "completed_steps": 0, "total_steps": 4},
+        "input": _json_value(result["input_json"]),
         "result": stored_result,
         "error": (
             {"code": result["error_code"], "message": result["error_message"]}

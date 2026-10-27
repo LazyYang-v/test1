@@ -7,7 +7,9 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from agentforge_core.evaluation import CORE_CASES
 from agentforge_core.migrations import MigrationError, apply_migrations
+from agentforge_core.schema_version import SCHEMA_VERSION
 
 VERSIONS_DIR = Path(__file__).resolve().parents[2] / "migrations" / "versions"
 
@@ -182,31 +184,65 @@ async def test_legacy_ledger_with_applied_rows_requires_manual_reconciliation(
         await apply_migrations(unmigrated_db["superuser_dsn"], tmp_path, {})
 
 
-async def test_raw_reexecution_after_clearing_bookkeeping_succeeds(migrated_db):
-    conn = await _connect(migrated_db["role_dsn"]("migrator"))
+async def test_replay_after_clearing_bookkeeping_fails_closed(migrated_db):
+    """A wiped ledger is tampering, not a recovery path.
+
+    Contract (2026-10-27 decision): normal re-runs are ledgered no-ops, and a
+    missing/tampered ledger must fail closed. Shipped migrations are not
+    required to be raw-SQL replayable, so clearing
+    ``agentforge.schema_migrations`` and re-running the migrator must raise —
+    never present itself as a successful recovery. The run must also stay
+    fail-closed afterwards: every committed migration keeps its ledger row,
+    no partially applied migration is recorded, key schema objects survive,
+    and the ledger never claims the full schema again.
+    """
+    dsn = migrated_db["role_dsn"]("migrator")
+    conn = await _connect(dsn)
     try:
         await conn.execute("DELETE FROM agentforge.schema_migrations")
     finally:
         await conn.close()
 
-    applied = await apply_migrations(
-        migrated_db["role_dsn"]("migrator"), VERSIONS_DIR, migrated_db["migrate_env"]
-    )
-    assert applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    # Replay hits migration 0009's unguarded ADD CONSTRAINT on an
+    # already-migrated schema and must abort, not silently converge.
+    with pytest.raises(asyncpg.DuplicateObjectError, match="tasks_trace_id_nonempty"):
+        await apply_migrations(dsn, VERSIONS_DIR, migrated_db["migrate_env"])
 
-    conn = await _connect(migrated_db["role_dsn"]("migrator"))
+    conn = await _connect(dsn)
     try:
-        version = await conn.fetchval(
-            "SELECT MAX(version) FROM agentforge.schema_migrations"
+        rows = await conn.fetch(
+            "SELECT version FROM agentforge.schema_migrations ORDER BY version"
         )
         schema_count = await conn.fetchval(
             "SELECT count(*) FROM pg_namespace WHERE nspname = ANY($1::text[])",
             sorted(EXPECTED_SCHEMAS),
         )
+        later_objects = await conn.fetchval(
+            "SELECT to_regclass('evaluation.datasets')::text"
+        )
+        case_count = await conn.fetchval("SELECT count(*) FROM evaluation.cases")
     finally:
         await conn.close()
-    assert version == 8
+
+    # Per-migration atomicity held: only fully committed migrations are in the
+    # ledger, as a contiguous prefix strictly below this build's expected
+    # version — the readiness probe will keep refusing this database.
+    applied = [row["version"] for row in rows]
+    assert applied == list(range(1, len(applied) + 1))
+    assert not applied or applied[-1] < SCHEMA_VERSION
+
+    # Schema and data survived the aborted replay untouched: all seven
+    # schemas, objects from post-ledger migrations, and the seeded benchmark
+    # cases are intact — the schema is deliberately ahead of the rewound
+    # ledger, which is why recovery requires manual reconciliation.
     assert schema_count == len(EXPECTED_SCHEMAS)
+    assert later_objects == "evaluation.datasets"
+    assert case_count == len(CORE_CASES)
+
+    # The tampering is permanent for the migrator: a subsequent normal run
+    # must still fail closed instead of "healing" the database.
+    with pytest.raises(asyncpg.DuplicateObjectError):
+        await apply_migrations(dsn, VERSIONS_DIR, migrated_db["migrate_env"])
 
 
 async def test_gapped_migration_directory_fails_before_applying_any_file(
@@ -291,7 +327,7 @@ async def test_api_role_reads_version_table_but_cannot_create_tables(migrated_db
         version = await conn.fetchval(
             "SELECT MAX(version) FROM agentforge.schema_migrations"
         )
-        assert version == 8
+        assert version == SCHEMA_VERSION
 
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await conn.execute("CREATE TABLE identity.forbidden (id INTEGER)")

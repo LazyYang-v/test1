@@ -65,7 +65,7 @@ class SnapshotModelAdapterFactory:
             raise ModelProviderConfigurationError(
                 "AGENTFORGE_DEEPSEEK_API_KEY is required for DeepSeek tasks"
             )
-        if model_name not in {"deepseek-chat", "deepseek-reasoner"}:
+        if model_name not in {"deepseek-flash", "deepseek-v4-pro"}:
             raise ModelProviderConfigurationError(
                 f"DeepSeek model {model_name!r} is not supported"
             )

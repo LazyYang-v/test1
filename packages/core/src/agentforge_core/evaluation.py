@@ -177,7 +177,14 @@ def evaluate_case(
             failures.append("METRIC_ASSERTION_FAILED")
 
     if "expected_row_count" in assertions:
-        passed = metric.get("row_count") == assertions["expected_row_count"]
+        # Row counts belong to platform Evidence, not the public report metrics.
+        observed_row_counts = [evidence.get("row_count") for evidence in evidences]
+        passed = bool(observed_row_counts) and all(
+            isinstance(row_count, int)
+            and not isinstance(row_count, bool)
+            and row_count == assertions["expected_row_count"]
+            for row_count in observed_row_counts
+        )
         checks["row_count"] = passed
         if not passed:
             failures.append("ROW_COUNT_ASSERTION_FAILED")

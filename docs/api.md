@@ -7,8 +7,9 @@ Base URL: `http://127.0.0.1:8000` (default `AGENTFORGE_API_PORT` in Compose).
 
 ## Authentication
 
-All `/api/v1/*` endpoints except `POST /api/v1/auth/login` require a bearer
-JWT (HS256) issued by the login endpoint. Tokens are short-lived:
+All `/api/v1/*` endpoints except `POST /api/v1/auth/login`, `POST /api/v1/bootstrap`,
+and `POST /api/v1/operator-recovery` require a bearer JWT. Bootstrap and recovery
+are unauthenticated only because each requires a short-lived, one-time secret.
 `jwt_ttl_seconds` is capped at 900 seconds (15 minutes). There is no refresh
 token and no session table; a new token is obtained by logging in again.
 
@@ -41,7 +42,8 @@ Returns the caller's identity and currently active region grants:
   "id": "<uuid>",
   "email": "user@example.com",
   "display_name": "...",
-  "regions": [{ "region_code": "CN_EAST", "permission": "read" }]
+  "regions": [{ "region_code": "CN_EAST", "permission": "read" }],
+  "operator_permissions": ["registry_operator"]
 }
 ```
 
@@ -55,15 +57,114 @@ Returns whether the caller currently holds an active grant for the region.
 Denied access produces a `region.authorization` audit event with decision
 `denied`.
 
+## Bootstrap and Operator administration
+
+Operator permissions and account status are read from PostgreSQL during each
+administrative request. JWTs do not contain permissions. Disabling an Operator
+increments `token_version`, invalidating every outstanding token.
+
+### `POST /api/v1/bootstrap` → `201 Created`
+
+One-time first-Operator creation. Obtain a 15-minute secret with the local
+`agentforge-bootstrap-secret issue-bootstrap` command; the database stores only
+its digest. The command displays secrets only to an interactive terminal.
+
+```json
+{
+  "bootstrap_secret": "<one-time secret>",
+  "email": "operator@example.com",
+  "display_name": "AgentForge Operator",
+  "initial_password": "<12 or more characters>"
+}
+```
+
+Success returns the new user ID, normalized email, display name, and both
+Operator permissions: `identity_admin` and `registry_operator`. A consumed,
+expired, or invalid secret cannot create another Operator.
+
+### `POST /api/v1/admin/identity/users` → `201 Created`
+
+Requires `identity_admin`. Creates an ACTIVE user and exactly one initial
+grant: `CN_EAST/read`. The user receives no Operator permission.
+
+```json
+{
+  "email": "analyst@example.com",
+  "display_name": "Analyst",
+  "initial_password": "<12 or more characters>"
+}
+```
+
+The response includes the user ID, status, region grant, and an empty
+`operator_permissions` list. Duplicate email returns `409 EMAIL_ALREADY_EXISTS`.
+
+### `POST /api/v1/admin/identity/operators/{user_id}/disable`
+
+Requires `identity_admin`. Disables an active Operator and invalidates existing
+sessions. Returns `{ "id": "<uuid>", "status": "disabled" }`.
+
+### `POST /api/v1/operator-recovery`
+
+Unauthenticated break-glass endpoint. The local CLI issues a 15-minute secret
+scoped to one Operator and one action. Each secret is single-use. For `restore`,
+send a new password; for `disable`, omit it.
+
+```json
+{
+  "recovery_secret": "<one-time secret>",
+  "new_password": "<required only for restore>"
+}
+```
+
+Returns the target ID and resulting status. Recovery actions, denials, secret
+issuance, and rotation are audited without recording secret values or passwords.
+
+## Authenticated Registry writes
+
+All `/api/v1/admin/registry/*` routes require a live `registry_operator`
+permission. `agentforge-registry` sends writes here with its bearer token;
+`agentforge_registry_cli` has read-only Registry table privileges after
+migration 0013.
+
+Relative route paths below are under `/api/v1/admin/registry`.
+
+- `POST /model-profiles`: creates a model profile. `credential_ref` must be a
+  `secret://` URI; `config_json` rejects embedded credential fields.
+- `POST /tools`: creates a tool version with input/output JSON Schemas, policy,
+  execution kind, and timeout.
+- `POST /agents`: creates a draft with `agent_key`, `version`, `name`,
+  `graph_key`, `model_profile`, and `config_json`. `created_by` is set from the
+  authenticated principal.
+- `PUT /agents/{version_id}/tools/{tool_id}`: binds a tool to the draft; policy
+  overrides may only tighten the base policy.
+- `POST /agents/{version_id}/publish`: validates and publishes the draft,
+  freezes its model configuration, and records the authenticated actor.
+- `POST /agents/{version_id}/retire`: retires a published version.
+
+Successful write responses return the fields documented by each operation:
+model profiles return `id` and `profile_key`; tools return `id`, `tool_key`, and
+`version`; draft Agents return `id`, `agent_key`, `version`, and `status`;
+bindings return both version IDs and `policy_override`; publish returns the
+published Agent fields, frozen `model_config_snapshot`, `config_hash`, and
+`published_at`; retire returns `id` and `status`. Registry audit metadata records
+resource keys and IDs, never request secrets or config payloads.
+
+These routes return `403 OPERATOR_PERMISSION_REQUIRED` without the required
+permission, `409 REGISTRY_CONFLICT` for conflicting lifecycle or uniqueness
+state, and `400 INVALID_REQUEST` for invalid configuration.
+
 ## Unified error body
 
 Every error returned by the API has the same JSON shape:
 
 ```json
 {
-  "code": "REGION_ACCESS_DENIED",
-  "message": "Access to this region is denied",
-  "retryable": false,
+  "error": {
+    "code": "REGION_ACCESS_DENIED",
+    "message": "Access to this region is denied",
+    "retryable": false,
+    "details": {}
+  },
   "request_id": "<request-scoped id>"
 }
 ```
@@ -80,6 +181,25 @@ translated into the same body with code `INVALID_REQUEST`.
 | `UNAUTHENTICATED` | 401 | no | Missing/expired/invalid JWT, bad login credentials, expired SSE stream token |
 | `REGION_ACCESS_DENIED` | 403 | no | Task regions outside the caller's active grants |
 | `INVALID_REQUEST` | 400 | no | Malformed body or query, missing/too-long Idempotency-Key, unknown agent_key, bad Last-Event-ID, list filter errors, live-mode misuse |
+| `BOOTSTRAP_UNAVAILABLE` | 403 | no | Missing or incorrect Bootstrap secret |
+| `BOOTSTRAP_EXPIRED` | 410 | no | Bootstrap secret expired |
+| `BOOTSTRAP_CONSUMED` | 409 | no | Bootstrap secret already consumed |
+| `BOOTSTRAP_ALREADY_INITIALIZED` | 409 | no | An Operator already exists |
+| `RECOVERY_UNAVAILABLE` | 403 | no | Missing or incorrect recovery secret |
+| `RECOVERY_EXPIRED` | 410 | no | Recovery secret expired |
+| `RECOVERY_CONSUMED` | 409 | no | Recovery secret already consumed |
+| `OPERATOR_PERMISSION_REQUIRED` | 403 | no | Missing live Operator permission |
+| `EMAIL_ALREADY_EXISTS` | 409 | no | Identity email already exists |
+| `OPERATOR_NOT_FOUND` | 404 | no | Operator does not exist |
+| `OPERATOR_NOT_ACTIVE` | 409 | no | Disable target is already inactive |
+| `OPERATOR_STATE_CONFLICT` | 409 | no | Recovery target changed state |
+| `MODEL_PROFILE_NOT_FOUND` | 404 | no | Registry draft references an unknown model profile |
+| `TOOL_VERSION_NOT_FOUND` | 404 | no | Requested tool version does not exist |
+| `AGENT_VERSION_NOT_FOUND` | 404 | no | Requested Agent version does not exist |
+| `AGENT_VALIDATION_FAILED` | 409 | no | Draft is not valid for publication |
+| `AGENT_VERSION_NOT_PUBLISHED` | 409 | no | Retirement requires a published Agent version |
+| `INVALID_POLICY_OVERRIDE` | 400 | no | Tool policy override would loosen its base policy |
+| `REGISTRY_CONFLICT` | 409 | no | Registry uniqueness or lifecycle conflict |
 | `TASK_NOT_FOUND` | 404 | no | Task missing **or** owned by another user (existence is not leaked) |
 | `IDEMPOTENCY_CONFLICT` | 409 | no | Same Idempotency-Key used with a different canonical request |
 | `INVALID_STATE_TRANSITION` | 409 | no | Cancel rejected: terminal task, cancel already requested, stale optimistic `expected_version`, invalid state |
@@ -159,7 +279,9 @@ ordered newest first, as `{"items": [...], "total": n}`. Unknown status →
 ### `GET /api/v1/tasks/{task_id}`
 
 Returns status, resolved `agent_version`, `current_attempt_no`, progress,
-`result` and `error`. Result/error payloads are **redacted (null)** when the
+`input` (the stored canonical request: `question`, `region_codes`,
+`date_range`, `compare_mode`), `result` and `error`. Result/error payloads are
+**redacted (null)** when the
 caller's region grant for the task's regions has been revoked — ownership
 alone does not re-authorize stored results. A foreign task is a 404.
 

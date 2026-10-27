@@ -6,6 +6,7 @@ import uuid
 
 import asyncpg
 import pytest
+from agentforge_core.schema_version import SCHEMA_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -30,6 +31,8 @@ EXPECTED_COLUMNS = {
         "provider", "model_name", "context_hash", "input_tokens", "output_tokens",
         "estimated_cost", "status", "error_code", "trace_id", "started_at",
         "finished_at",
+        # Migration 0012: additive per-call provider metadata.
+        "provider_request_id", "provider_parameters", "duration_ms",
     },
     ("harness", "tool_invocations"): {
         "id", "task_id", "attempt_id", "invocation_key", "tool_version_id",
@@ -117,7 +120,7 @@ async def _seed_task(migrated_db) -> None:
         await conn.close()
 
 
-async def test_migrations_through_0010_tables_columns_and_version(migrated_db):
+async def test_current_migrations_keep_harness_columns_and_version(migrated_db):
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         for schema, tables in NEW_TABLES.items():
@@ -134,7 +137,7 @@ async def test_migrations_through_0010_tables_columns_and_version(migrated_db):
         version = await conn.fetchval(
             "SELECT MAX(version) FROM agentforge.schema_migrations"
         )
-        assert version == 10
+        assert version == SCHEMA_VERSION
         privileges = await conn.fetchrow(
             """
             SELECT

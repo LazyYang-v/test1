@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -36,7 +38,10 @@ def _json_object(value: str, label: str) -> dict[str, Any]:
 
 
 def _reject_embedded_credentials(value: Any, path: str = "config_json") -> None:
-    forbidden = re.compile(r"(?:api[_-]?key|access[_-]?token|password|secret|credential)$", re.I)
+    forbidden = re.compile(
+        r"(?:api[_-]?key|access[_-]?token|password|secret|credential)$",
+        re.IGNORECASE,
+    )
     if isinstance(value, dict):
         for key, nested in value.items():
             if forbidden.search(key):
@@ -65,6 +70,10 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _decode_jsonb(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
 def _print(value: Any) -> None:
     print(json.dumps(_json_value(value), sort_keys=True, ensure_ascii=False))
 
@@ -84,6 +93,74 @@ async def _connect() -> asyncpg.Connection:
         format="text",
     )
     return conn
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str,
+        headers: Any, newurl: str,
+    ) -> None:
+        return None
+
+
+async def _api_request(
+    method: str, path: str, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Send one authenticated Registry write request to the API."""
+    base_url = os.environ.get("AGENTFORGE_API_URL", "http://127.0.0.1:8000").rstrip("/")
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise RegistryError("AGENTFORGE_API_URL must be an HTTP(S) base URL")
+    token = os.environ.get("AGENTFORGE_ACCESS_TOKEN")
+    if not token:
+        raise RegistryError("AGENTFORGE_ACCESS_TOKEN is required for Registry writes")
+    request_body = (
+        None
+        if payload is None
+        else json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if request_body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        f"{base_url}{path}", data=request_body, headers=headers, method=method
+    )
+
+    def send() -> dict[str, Any]:
+        try:
+            opener = urllib.request.build_opener(_NoRedirectHandler)
+            with opener.open(request, timeout=30) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            try:
+                response_body = json.loads(error.read())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                response_body = {}
+            error_body = response_body.get("error", {})
+            code = error_body.get("code")
+            message = error_body.get("message")
+            if isinstance(code, str) and isinstance(message, str):
+                details = error_body.get("details")
+                validation_errors = (
+                    details.get("errors") if isinstance(details, Mapping) else None
+                )
+                if isinstance(validation_errors, list):
+                    messages = [item for item in validation_errors if isinstance(item, str)]
+                    if messages:
+                        message = f"{message}: {'; '.join(messages)}"
+                raise RegistryError(f"API request failed: {code}: {message}") from None
+            raise RegistryError(f"API request failed with HTTP {error.code}") from None
+        except urllib.error.URLError as error:
+            raise RegistryError(f"Registry API is unavailable: {error.reason}") from None
+
+    return await asyncio.to_thread(send)
 
 
 def _config_hash(
@@ -158,70 +235,39 @@ def _policy_override_only_tightens(
 async def _register_model_profile(args: argparse.Namespace) -> None:
     config = _json_object(args.config_json, "config_json")
     _reject_embedded_credentials(config)
-    profile_id = uuid.uuid4()
-    conn = await _connect()
-    try:
-        await conn.execute(
-            """
-            INSERT INTO registry.model_profiles
-                (id, profile_key, provider, model_name, endpoint_alias, credential_ref,
-                 timeout_ms, max_output_tokens, config_json)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-            """,
-            profile_id,
-            args.profile_key,
-            args.provider,
-            args.model_name,
-            args.endpoint_alias,
-            args.credential_ref,
-            args.timeout_ms,
-            args.max_output_tokens,
-            _canonical(config),
-        )
-    except asyncpg.UniqueViolationError:
-        raise RegistryError(f"model profile already exists: {args.profile_key}") from None
-    finally:
-        await conn.close()
-    _print({"id": profile_id, "profile_key": args.profile_key})
+    result = await _api_request(
+        "POST",
+        "/api/v1/admin/registry/model-profiles",
+        {
+            "profile_key": args.profile_key,
+            "provider": args.provider,
+            "model_name": args.model_name,
+            "endpoint_alias": args.endpoint_alias,
+            "credential_ref": args.credential_ref,
+            "timeout_ms": args.timeout_ms,
+            "max_output_tokens": args.max_output_tokens,
+            "config_json": config,
+        },
+    )
+    _print(result)
 
 
 async def _create_agent(args: argparse.Namespace) -> None:
     config = _json_object(args.config_json, "config_json")
     _reject_embedded_credentials(config)
-    agent_id = uuid.uuid4()
-    conn = await _connect()
-    try:
-        profile_id = await conn.fetchval(
-            "SELECT id FROM registry.model_profiles WHERE profile_key = $1",
-            args.model_profile,
-        )
-        if profile_id is None:
-            raise RegistryError(f"model profile not found: {args.model_profile}")
-        config_hash = hashlib.sha256(_canonical(config).encode("utf-8")).hexdigest()
-        await conn.execute(
-            """
-            INSERT INTO registry.agent_versions
-                (id, agent_key, version, name, graph_key, model_profile_id,
-                 model_config_snapshot, config_json, config_hash, status, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, $7::jsonb, $8, 'draft', $9)
-            """,
-            agent_id,
-            args.agent_key,
-            args.version,
-            args.name,
-            args.graph_key,
-            profile_id,
-            _canonical(config),
-            config_hash,
-            args.created_by,
-        )
-    except asyncpg.UniqueViolationError:
-        raise RegistryError(
-            f"agent version already exists: {args.agent_key}@{args.version}"
-        ) from None
-    finally:
-        await conn.close()
-    _print({"id": agent_id, "agent_key": args.agent_key, "version": args.version, "status": "draft"})
+    result = await _api_request(
+        "POST",
+        "/api/v1/admin/registry/agents",
+        {
+            "agent_key": args.agent_key,
+            "version": args.version,
+            "name": args.name,
+            "graph_key": args.graph_key,
+            "model_profile": args.model_profile,
+            "config_json": config,
+        },
+    )
+    _print(result)
 
 
 async def _validate_agent(
@@ -242,11 +288,14 @@ async def _validate_agent(
         errors.append("only draft agent versions can be validated for publication")
     profile = await conn.fetchrow(
         "SELECT provider, model_name, endpoint_alias, credential_ref, timeout_ms, "
-        "max_output_tokens, config_json FROM registry.model_profiles WHERE id = $1 FOR SHARE",
+        "max_output_tokens, config_json FROM registry.model_profiles WHERE id = $1",
         agent["model_profile_id"],
     )
     if profile is None:
         errors.append("model profile no longer exists")
+    else:
+        profile = dict(profile)
+        profile["config_json"] = _decode_jsonb(profile["config_json"])
     bindings = await conn.fetch(
         """
         SELECT b.tool_version_id, b.policy_override, t.status, t.policy_json
@@ -257,7 +306,10 @@ async def _validate_agent(
         """,
         version_id,
     )
+    bindings = [dict(binding) for binding in bindings]
     for binding in bindings:
+        binding["policy_json"] = _decode_jsonb(binding["policy_json"])
+        binding["policy_override"] = _decode_jsonb(binding["policy_override"])
         if binding["status"] != "active":
             errors.append(f"bound tool version {binding['tool_version_id']} is retired")
         tightens = _policy_override_only_tightens(
@@ -265,7 +317,11 @@ async def _validate_agent(
         )
         if not tightens:
             errors.append(f"bound tool version {binding['tool_version_id']} policy override loosens policy")
-    return {"agent": dict(agent), "profile": dict(profile) if profile else None, "bindings": [dict(row) for row in bindings]}, errors
+    return {
+        "agent": dict(agent),
+        "profile": profile,
+        "bindings": bindings,
+    }, errors
 
 
 async def _validate_command(args: argparse.Namespace) -> None:
@@ -280,151 +336,53 @@ async def _validate_command(args: argparse.Namespace) -> None:
 
 
 async def _publish_agent(args: argparse.Namespace) -> None:
-    version_id = uuid.UUID(args.version_id)
-    actor_id = uuid.UUID(args.actor_id)
-    conn = await _connect()
-    try:
-        async with conn.transaction():
-            await conn.execute("SELECT set_config('agentforge.actor_id', $1, true)", str(actor_id))
-            await conn.fetchval(
-                "SELECT id FROM registry.agent_versions WHERE id = $1 FOR UPDATE",
-                version_id,
-            )
-            details, errors = await _validate_agent(conn, version_id, lock=True)
-            if errors:
-                raise RegistryError("agent version validation failed: " + "; ".join(errors))
-            profile = details["profile"]
-            snapshot = {
-                "provider": profile["provider"],
-                "model_name": profile["model_name"],
-                "endpoint_alias": profile["endpoint_alias"],
-                "credential_ref": profile["credential_ref"],
-                "timeout_ms": profile["timeout_ms"],
-                "max_output_tokens": profile["max_output_tokens"],
-                "config_json": profile["config_json"],
-            }
-            bindings = [
-                {
-                    "tool_version_id": str(row["tool_version_id"]),
-                    "policy_override": row["policy_override"],
-                }
-                for row in details["bindings"]
-            ]
-            config_hash = _config_hash(
-                agent_key=details["agent"]["agent_key"],
-                version=details["agent"]["version"],
-                graph_key=details["agent"]["graph_key"],
-                config_json=(await conn.fetchval(
-                    "SELECT config_json FROM registry.agent_versions WHERE id = $1",
-                    version_id,
-                )),
-                model_config_snapshot=snapshot,
-                bindings=bindings,
-            )
-            await conn.execute(
-                """
-                UPDATE registry.agent_versions
-                SET model_config_snapshot = $2::jsonb,
-                    config_hash = $3,
-                    status = 'published',
-                    published_at = now()
-                WHERE id = $1
-                """,
-                version_id,
-                _canonical(snapshot),
-                config_hash,
-            )
-            row = await conn.fetchrow(
-                "SELECT id, agent_key, version, status, model_config_snapshot, config_hash, published_at "
-                "FROM registry.agent_versions WHERE id = $1",
-                version_id,
-            )
-    finally:
-        await conn.close()
-    _print(dict(row))
+    version_id = str(uuid.UUID(args.version_id))
+    result = await _api_request(
+        "POST", f"/api/v1/admin/registry/agents/{version_id}/publish"
+    )
+    _print(result)
 
 
 async def _retire_agent(args: argparse.Namespace) -> None:
-    version_id = uuid.UUID(args.version_id)
-    actor_id = uuid.UUID(args.actor_id)
-    conn = await _connect()
-    try:
-        async with conn.transaction():
-            await conn.execute("SELECT set_config('agentforge.actor_id', $1, true)", str(actor_id))
-            result = await conn.execute(
-                "UPDATE registry.agent_versions SET status = 'retired' "
-                "WHERE id = $1 AND status = 'published'",
-                version_id,
-            )
-            if result == "UPDATE 0":
-                raise RegistryError(f"published agent version not found: {version_id}")
-            row = await conn.fetchrow(
-                "SELECT id, agent_key, version, status FROM registry.agent_versions WHERE id = $1",
-                version_id,
-            )
-    finally:
-        await conn.close()
-    _print(dict(row))
+    version_id = str(uuid.UUID(args.version_id))
+    result = await _api_request(
+        "POST", f"/api/v1/admin/registry/agents/{version_id}/retire"
+    )
+    _print(result)
 
 
 async def _bind_tool(args: argparse.Namespace) -> None:
-    version_id = uuid.UUID(args.version_id)
-    tool_id = uuid.UUID(args.tool_id)
+    version_id = str(uuid.UUID(args.version_id))
+    tool_id = str(uuid.UUID(args.tool_id))
     override = _json_object(args.policy_override_json, "policy_override_json")
-    conn = await _connect()
-    try:
-        try:
-            await conn.execute(
-                """
-                INSERT INTO registry.agent_tool_bindings
-                    (agent_version_id, tool_version_id, policy_override)
-                VALUES ($1, $2, $3::jsonb)
-                """,
-                version_id,
-                tool_id,
-                _canonical(override),
-            )
-        except asyncpg.CheckViolationError as error:
-            raise RegistryError(str(error).split("\n", 1)[0]) from None
-        row = await conn.fetchrow(
-            "SELECT agent_version_id, tool_version_id, policy_override "
-            "FROM registry.agent_tool_bindings WHERE agent_version_id = $1 AND tool_version_id = $2",
-            version_id,
-            tool_id,
-        )
-    finally:
-        await conn.close()
-    _print(dict(row))
+    result = await _api_request(
+        "PUT",
+        f"/api/v1/admin/registry/agents/{version_id}/tools/{tool_id}",
+        {"policy_override": override},
+    )
+    _print(result)
 
 
 async def _register_tool(args: argparse.Namespace) -> None:
     input_schema = _json_object(args.input_schema_json, "input_schema_json")
     output_schema = _json_object(args.output_schema_json, "output_schema_json")
     policy = _json_object(args.policy_json, "policy_json")
-    tool_id = uuid.uuid4()
-    conn = await _connect()
-    try:
-        await conn.execute(
-            """
-            INSERT INTO registry.tool_versions
-                (id, tool_key, version, input_schema, output_schema, policy_json,
-                 execution_kind, timeout_ms)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8)
-            """,
-            tool_id,
-            args.tool_key,
-            args.version,
-            _canonical(input_schema),
-            _canonical(output_schema),
-            _canonical(policy),
-            args.execution_kind,
-            args.timeout_ms,
-        )
-    except asyncpg.UniqueViolationError:
-        raise RegistryError(f"tool version already exists: {args.tool_key}@{args.version}") from None
-    finally:
-        await conn.close()
-    _print({"id": tool_id, "tool_key": args.tool_key, "version": args.version})
+    result = await _api_request(
+        "POST",
+        "/api/v1/admin/registry/tools",
+        {
+            "tool_key": args.tool_key,
+            "version": args.version,
+            "input_schema": input_schema,
+            "output_schema": output_schema,
+            "policy_json": policy,
+            "execution_kind": args.execution_kind,
+            "timeout_ms": args.timeout_ms,
+        },
+    )
+    _print(result)
+
+
 
 
 async def _show_agent(args: argparse.Namespace) -> None:
@@ -486,7 +444,6 @@ def _build_parser() -> argparse.ArgumentParser:
     create_agent.add_argument("--graph-key", required=True)
     create_agent.add_argument("--model-profile", required=True)
     create_agent.add_argument("--config-json", default="{}")
-    create_agent.add_argument("--created-by", type=uuid.UUID)
     create_agent.set_defaults(handler=_create_agent)
 
     validate_agent = agent_subcommands.add_parser("validate")
@@ -495,12 +452,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     publish_agent = agent_subcommands.add_parser("publish")
     publish_agent.add_argument("--version-id", required=True)
-    publish_agent.add_argument("--actor-id", required=True)
     publish_agent.set_defaults(handler=_publish_agent)
 
     retire_agent = agent_subcommands.add_parser("retire")
     retire_agent.add_argument("--version-id", required=True)
-    retire_agent.add_argument("--actor-id", required=True)
     retire_agent.set_defaults(handler=_retire_agent)
 
     resolve_agent = agent_subcommands.add_parser("resolve")

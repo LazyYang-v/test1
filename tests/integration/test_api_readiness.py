@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from agentforge_api.app import create_app
 from agentforge_api.config import Settings
+from agentforge_core.schema_version import SCHEMA_VERSION
 
 
 pytestmark = pytest.mark.integration
@@ -58,14 +59,20 @@ async def test_ready_requires_exact_migration_version(migrated_db):
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "expected_schema_version": 10,
-        "applied_schema_version": 10,
+        "expected_schema_version": SCHEMA_VERSION,
+        "applied_schema_version": SCHEMA_VERSION,
     }
 
+    # Un-apply the newest migration instead of rewriting the ledger: version
+    # rows are append-only in a fully migrated database, so any UPDATE onto an
+    # existing version would collide with the primary key. Rolling the newest
+    # row back leaves a contiguous 1..N-1 ledger, which the API must reject as
+    # a version mismatch against this build's expected schema version.
     conn = await asyncpg.connect(migrated_db["role_dsn"]("migrator"))
     try:
         await conn.execute(
-            "UPDATE agentforge.schema_migrations SET version = 11 WHERE version = 10"
+            "DELETE FROM agentforge.schema_migrations "
+            "WHERE version = (SELECT MAX(version) FROM agentforge.schema_migrations)"
         )
     finally:
         await conn.close()

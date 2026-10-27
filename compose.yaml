@@ -38,7 +38,7 @@ services:
     # Deterministic dataset generation and load are idempotent: the loader is
     # a no-op once the frozen snapshot is complete, and the content hash must
     # stay stable across environments.
-    command: ["/bin/sh", "-c", "agentforge-dataset /tmp/business.jsonl && agentforge-seed /tmp/business.jsonl"]
+    command: ["/bin/sh", "-c", "/app/.venv/bin/agentforge-dataset /tmp/business.jsonl && /app/.venv/bin/agentforge-seed /tmp/business.jsonl"]
     environment:
       AGENTFORGE_MIGRATOR_DSN: postgresql://agentforge_migrator:${AGENTFORGE_MIGRATOR_DB_PASSWORD:-agentforge-local-migrator}@postgres:5432/agentforge
     depends_on:
@@ -60,7 +60,7 @@ services:
       seed:
         condition: service_completed_successfully
     ports:
-      - "${AGENTFORGE_API_PORT:-8000}:8000"
+      - "127.0.0.1:${AGENTFORGE_API_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
       interval: 5s
@@ -79,7 +79,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "${AGENTFORGE_WEB_PORT:-3000}:8080"
+      - "127.0.0.1:${AGENTFORGE_WEB_PORT:-3000}:8080"
     environment:
       API_UPSTREAM: ${AGENTFORGE_API_UPSTREAM:-api:8000}
       NGINX_ENVSUBST_FILTER: ^API_UPSTREAM$
@@ -102,6 +102,13 @@ services:
       AGENTFORGE_WORKER_DB_DSN: postgresql://agentforge_worker:${AGENTFORGE_WORKER_DB_PASSWORD:-agentforge-local-worker}@postgres:5432/agentforge
       AGENTFORGE_BUSINESS_RO_DB_DSN: postgresql://agentforge_business_ro:${AGENTFORGE_BUSINESS_RO_DB_PASSWORD:-agentforge-local-business-ro}@postgres:5432/agentforge
       AGENTFORGE_BUSINESS_RO_STATEMENT_TIMEOUT_MS: ${AGENTFORGE_BUSINESS_RO_STATEMENT_TIMEOUT_MS:-3000}
+      AGENTFORGE_MODEL_PROVIDER: ${AGENTFORGE_MODEL_PROVIDER:-fake}
+      AGENTFORGE_DEEPSEEK_API_KEY: ${AGENTFORGE_DEEPSEEK_API_KEY:-}
+      AGENTFORGE_DEEPSEEK_BASE_URL: ${AGENTFORGE_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      AGENTFORGE_MODEL_TIMEOUT_SECONDS: ${AGENTFORGE_MODEL_TIMEOUT_SECONDS:-60}
+      AGENTFORGE_MAX_MODEL_REPAIRS: ${AGENTFORGE_MAX_MODEL_REPAIRS:-2}
+      AGENTFORGE_RETRY_BASE_DELAY_SECONDS: ${AGENTFORGE_RETRY_BASE_DELAY_SECONDS:-30}
+      AGENTFORGE_RETRY_JITTER_SECONDS: ${AGENTFORGE_RETRY_JITTER_SECONDS:-5}
       AGENTFORGE_WORKER_ID: ${AGENTFORGE_WORKER_ID:-worker-1}
       AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS: ${AGENTFORGE_HEARTBEAT_INTERVAL_SECONDS:-5}
       AGENTFORGE_LEASE_SECONDS: ${AGENTFORGE_LEASE_SECONDS:-30}

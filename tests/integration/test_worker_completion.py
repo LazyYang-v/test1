@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import json
-import uuid
 from decimal import Decimal
 
 import asyncpg
 import pytest
-
 from agentforge_harness.models import FakeModel, FakeScript
 from agentforge_runtime.store import RuntimeStore
 from agentforge_worker.config import WorkerSettings
 from agentforge_worker.executors import MetricsQueryExecutor
+from agentforge_worker.model_factory import SnapshotModelAdapterFactory
 from agentforge_worker.worker import Worker
-
 from worker_support import (
     FROZEN_DATE_RANGE,
     SNAPSHOT_ID,
@@ -22,8 +20,8 @@ from worker_support import (
     create_task_via_api,
     fetch_attempts,
     fetch_audits,
-    fetch_evidences,
     fetch_events,
+    fetch_evidences,
     fetch_steps,
     fetch_task,
     get_task_via_api,
@@ -62,7 +60,9 @@ def _settings(db: dict, **overrides) -> WorkerSettings:
     return WorkerSettings(**values)
 
 
-async def _run_worker(migrated_db, model: FakeModel, **overrides) -> bool:
+async def _run_worker(
+    migrated_db, model: FakeModel | SnapshotModelAdapterFactory, **overrides
+) -> bool:
     pool = await asyncpg.create_pool(
         migrated_db["role_dsn"]("worker"), min_size=1, max_size=5
     )
@@ -76,6 +76,9 @@ async def _run_worker(migrated_db, model: FakeModel, **overrides) -> bool:
         return await worker.run_once()
     finally:
         await worker.close()
+        close_model = getattr(model, "aclose", None)
+        if callable(close_model):
+            await close_model()
 
 
 async def _prepared_task(migrated_db, *, agent_key="sales-report", bind_tool=True):
@@ -89,8 +92,8 @@ async def _prepared_task(migrated_db, *, agent_key="sales-report", bind_tool=Tru
 
 async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_db):
     db = migrated_db
-    seeded, task_id = await _prepared_task(db)
-    model = FakeModel()
+    _, task_id = await _prepared_task(db)
+    model = SnapshotModelAdapterFactory(_settings(db))
 
     assert await _run_worker(db, model) is True
 
@@ -169,8 +172,9 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
     conn = await asyncpg.connect(db["role_dsn"]("migrator"))
     try:
         invocations = await conn.fetch(
-            "SELECT invocation_key, status, input_tokens, output_tokens, trace_id, "
-            "estimated_cost, provider_request_id, provider_parameters, duration_ms "
+            "SELECT invocation_key, provider, model_name, status, "
+            "input_tokens, output_tokens, trace_id, estimated_cost, "
+            "provider_request_id, provider_parameters, duration_ms "
             "FROM harness.model_invocations WHERE task_id = $1::uuid "
             "ORDER BY started_at, invocation_key",
             task_id,
@@ -183,6 +187,8 @@ async def test_scripted_fake_runs_four_ordered_steps_to_a_valid_report(migrated_
     finally:
         await conn.close()
     assert len(invocations) == 2
+    assert all(row["provider"] == "fake" for row in invocations)
+    assert all(row["model_name"] == "fake-v1" for row in invocations)
     assert all(row["status"] == "succeeded" for row in invocations)
     assert all(row["trace_id"] == task_id for row in invocations)
     assert all(row["input_tokens"] > 0 and row["output_tokens"] > 0 for row in invocations)
@@ -261,14 +267,20 @@ async def test_unbound_tool_fails_closed_and_is_audited(migrated_db):
     assert "task.completed" not in [event["type"] for event in events]
 
 
-async def test_invalid_tool_arguments_fail_closed_and_are_audited(migrated_db):
+async def test_invalid_tool_arguments_fail_closed_and_are_audited(
+    migrated_db, monkeypatch
+):
     db = migrated_db
     _, task_id = await _prepared_task(db)
+    # PLAN_SCHEMA accepts any non-empty metric string, but the published
+    # metrics.query input schema only permits the registered "gmv" metric.
+    # Keep every other field valid so this reaches and fails at the gateway's
+    # registered-tool schema check instead of model-output repair.
     invalid_plan = {
-        "metric": "gmv",
+        "metric": "unregistered_metric",
         "metric_version": 1,
         "dimensions": ["region_code"],
-        "filters": {},
+        "filters": {"region_code": ["CN_EAST"]},
         "time_range": dict(FROZEN_DATE_RANGE),
         "comparison": "previous_period",
         "limit": 100,
@@ -277,20 +289,33 @@ async def test_invalid_tool_arguments_fail_closed_and_are_audited(migrated_db):
         scripts={"plan_metrics:0": [FakeScript(content=invalid_plan)]}
     )
 
+    executor_calls = 0
+    original_execute = MetricsQueryExecutor.execute
+
+    async def count_executor_calls(executor, request, context):
+        nonlocal executor_calls
+        executor_calls += 1
+        return await original_execute(executor, request, context)
+
+    monkeypatch.setattr(MetricsQueryExecutor, "execute", count_executor_calls)
+
     assert await _run_worker(db, model) is True
+    assert len(model.requests) == 1
+    assert executor_calls == 0
 
     task = await fetch_task(db, task_id)
     assert task["status"] == "failed"
-    assert task["error_code"] == "TOOL_INPUT_INVALID"
+    assert task["error_code"] == "QUERY_PLAN_INVALID"
     assert await fetch_evidences(db, task_id) == []
     audits = await fetch_audits(db, action="tool.invocation")
-    assert audits[-1]["decision"] == "denied"
-    assert audits[-1]["reason_code"] == "TOOL_INPUT_INVALID"
+    assert len(audits) == 1
+    assert audits[0]["decision"] == "denied"
+    assert audits[0]["reason_code"] == "QUERY_PLAN_INVALID"
     steps = {step["step_key"]: step for step in await fetch_steps(db, task_id)}
-    assert (steps["execute_metrics:0"]["step_key"], steps["execute_metrics:0"]["status"]) == (
-        "execute_metrics:0",
-        "failed",
-    )
+    assert (
+        steps["execute_metrics:0"]["step_key"],
+        steps["execute_metrics:0"]["status"],
+    ) == ("execute_metrics:0", "failed")
 
 
 async def test_live_region_revocation_is_checked_even_with_authorization_snapshot(
@@ -408,8 +433,6 @@ async def test_worker_uses_frozen_agent_snapshot_not_mutable_profile(migrated_db
         "publish",
         "--version-id",
         seeded["agent_id"],
-        "--actor-id",
-        str(uuid.uuid4()),
     )
     assert published["model_config_snapshot"]["provider"] == "fake"
     assert published["model_config_snapshot"]["model_name"] == "fake-v1"
@@ -417,7 +440,7 @@ async def test_worker_uses_frozen_agent_snapshot_not_mutable_profile(migrated_db
     await complete_dataset_load(db)
 
     # The profile row is mutable; published Agent runs must ignore these changes.
-    registry = await asyncpg.connect(db["role_dsn"]("registry_cli"))
+    registry = await asyncpg.connect(db["role_dsn"]("migrator"))
     try:
         await registry.execute(
             "UPDATE registry.model_profiles "

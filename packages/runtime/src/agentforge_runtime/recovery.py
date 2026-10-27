@@ -235,6 +235,12 @@ def validate_recovery_records(
     for record in (evidence, invocation):
         if record.get("result_hash") is not None and record["result_hash"].strip() != expected_hash:
             return "confirmed tool result hash does not match persisted result"
+    numeric_precision = {
+        "current_value": 2,
+        "previous_value": 2,
+        "absolute_change": 2,
+        "change_rate": 4,
+    }
     for evidence_field, result_field in (
         ("metric_key", "metric"),
         ("metric_version", "metric_version"),
@@ -244,9 +250,16 @@ def validate_recovery_records(
         ("absolute_change", "absolute_change"),
         ("change_rate", "change_rate"),
     ):
-        if evidence.get(evidence_field) != tool_result.get(result_field):
-            if evidence_field == "change_rate" and evidence.get(evidence_field) is None:
-                if tool_result.get(result_field) is None:
+        evidence_value = evidence.get(evidence_field)
+        result_value = tool_result.get(result_field)
+        if evidence_field in numeric_precision and evidence_value is not None:
+            evidence_number = Decimal(evidence_value)
+            if not evidence_number.is_finite():
+                return f"confirmed tool evidence {evidence_field} is not finite"
+            evidence_value = f"{evidence_number:.{numeric_precision[evidence_field]}f}"
+        if evidence_value != result_value:
+            if evidence_field == "change_rate" and evidence_value is None:
+                if result_value is None:
                     continue
             return f"confirmed tool result does not match evidence {evidence_field}"
 

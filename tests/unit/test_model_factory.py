@@ -44,7 +44,7 @@ def test_fake_and_deepseek_are_selected_from_frozen_model_snapshot():
             "model_name": "mutable-profile-value",
             "model_config_snapshot": {
                 "provider": "deepseek",
-                "model_name": "deepseek-chat",
+                "model_name": "deepseek-flash",
                 "config_json": {"temperature": 0, "top_p": 0.9},
             },
         }
@@ -52,18 +52,41 @@ def test_fake_and_deepseek_are_selected_from_frozen_model_snapshot():
 
     assert isinstance(fake, FakeModel)
     assert isinstance(deepseek, DeepSeekModel)
-    assert deepseek.model_name == "deepseek-chat"
+    assert deepseek.model_name == "deepseek-flash"
     assert deepseek_factory.resolve(
         {
             "model_config_snapshot": {
                 "provider": "deepseek",
-                "model_name": "deepseek-chat",
+                "model_name": "deepseek-flash",
                 "config_json": {"temperature": 0, "top_p": 0.9},
             }
         }
     ) is deepseek
     assert callable(getattr(fake, "generate"))
     assert callable(getattr(deepseek, "generate"))
+
+
+@pytest.mark.parametrize("model_name", ["deepseek-flash", "deepseek-v4-pro"])
+def test_factory_accepts_documented_deepseek_model_names(model_name):
+    factory = SnapshotModelAdapterFactory(
+        WorkerSettings(
+            worker_db_dsn=WORKER_DSN,
+            model_provider="deepseek",
+            deepseek_api_key="unit-test-key",
+        )
+    )
+
+    model = factory.resolve(
+        {
+            "model_config_snapshot": {
+                "provider": "deepseek",
+                "model_name": model_name,
+            }
+        }
+    )
+
+    assert isinstance(model, DeepSeekModel)
+    assert model.model_name == model_name
 
 
 async def test_fake_provider_does_not_require_or_initialize_live_credentials():
@@ -90,9 +113,9 @@ def test_worker_rejects_unsupported_provider_configuration():
 
 def test_worker_rejects_credential_or_http_deepseek_base_url():
     for url in (
-        "http://api.deepseek.com/v1",
-        "https://user:secret@api.deepseek.com/v1",
-        "https://api.deepseek.com/v1?key=secret",
+        "http://api.deepseek.com",
+        "https://user:secret@api.deepseek.com",
+        "https://api.deepseek.com?key=secret",
     ):
         with pytest.raises(ValidationError):
             WorkerSettings(worker_db_dsn=WORKER_DSN, deepseek_base_url=url)

@@ -55,7 +55,7 @@ def _adapter(handler, **kwargs):
     transport = httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
     return DeepSeekModel(
-        model_name="deepseek-chat",
+        model_name="deepseek-flash",
         api_key="test-secret",
         client=client,
         **kwargs,
@@ -85,7 +85,7 @@ async def test_chat_completion_uses_json_object_and_returns_provider_accounting(
 
     model, client = _adapter(
         handler,
-        base_url="https://api.deepseek.test/v1/",
+        base_url="https://api.deepseek.test/",
         input_cost_per_million=Decimal("0.27"),
         output_cost_per_million=Decimal("1.10"),
     )
@@ -96,9 +96,9 @@ async def test_chat_completion_uses_json_object_and_returns_provider_accounting(
     finally:
         await client.aclose()
 
-    assert observed["url"] == "https://api.deepseek.test/v1/chat/completions"
+    assert observed["url"] == "https://api.deepseek.test/chat/completions"
     assert observed["authorization"] == "Bearer test-secret"
-    assert observed["body"]["model"] == "deepseek-chat"
+    assert observed["body"]["model"] == "deepseek-flash"
     assert observed["body"]["response_format"] == {"type": "json_object"}
     assert observed["body"]["max_tokens"] == 128
     assert observed["body"]["temperature"] == 0
@@ -153,7 +153,7 @@ async def test_http_statuses_have_stable_provider_error_classes(status, expected
 
     assert raised.value.duration_ms >= 0
     assert raised.value.provider_parameters["response_format"] == {"type": "json_object"}
-    assert raised.value.provider_parameters["model"] == "deepseek-chat"
+    assert raised.value.provider_parameters["model"] == "deepseek-flash"
     if status == 429:
         assert raised.value.retry_after_seconds == 7
     assert raised.value.provider_request_id == "req-error-2"

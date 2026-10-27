@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 import asyncpg
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from agentforge_api.app import create_app
 from agentforge_api.config import Settings
 from agentforge_harness.models import FakeModel
 from agentforge_runtime.store import RuntimeStore
 from agentforge_worker.config import WorkerSettings
 from agentforge_worker.worker import Worker
-
+from httpx import ASGITransport, AsyncClient
 from worker_support import (
     SNAPSHOT_ID,
-    USER_ID,
     app_for,
     complete_dataset_load,
     seed_agent,
@@ -105,7 +101,19 @@ async def test_public_api_runs_all_fixed_cases_as_hidden_svc_eval_tasks(migrated
 
     assert result.status_code == 200, result.text
     payload = result.json()
-    assert payload["status"] == "completed"
+    assert payload["status"] == "completed", {
+        "status": payload["status"],
+        "summary": payload.get("summary"),
+        "failed_cases": [
+            {
+                "case_key": case.get("case_key"),
+                "failure_codes": case.get("failure_codes"),
+                "checks": (case.get("score") or {}).get("checks"),
+            }
+            for case in payload.get("case_results", [])
+            if case.get("status") != "passed"
+        ],
+    }
     assert payload["summary"] == {
         "total": 10,
         "passed": 10,

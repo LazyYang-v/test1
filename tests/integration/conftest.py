@@ -231,20 +231,26 @@ def migrated_db(postgres_server, migrated_template_db):
     """A fresh database cloned from the session's migrated template."""
     name = f"agentforge_it_{uuid.uuid4().hex[:8]}"
     _clone_database(postgres_server, migrated_template_db, name)
+    context = {
+        "name": name,
+        "server": postgres_server,
+        "superuser_dsn": f"{postgres_server['superuser_dsn_prefix']}/{name}",
+        "role_dsn": lambda role: (
+            f"postgresql://{ROLE_USERS[role]}:{ROLE_PASSWORDS[role]}"
+            f"@{postgres_server['host']}/{name}"
+        ),
+        "migrate_env": TEST_DB_PASSWORDS,
+        "repo_root": REPO_ROOT,
+    }
     try:
-        yield {
-            "name": name,
-            "server": postgres_server,
-            "superuser_dsn": f"{postgres_server['superuser_dsn_prefix']}/{name}",
-            "role_dsn": lambda role: (
-                f"postgresql://{ROLE_USERS[role]}:{ROLE_PASSWORDS[role]}"
-                f"@{postgres_server['host']}/{name}"
-            ),
-            "migrate_env": TEST_DB_PASSWORDS,
-            "repo_root": REPO_ROOT,
-        }
+        yield context
     finally:
-        _drop_database(postgres_server, name)
+        try:
+            cleanup = context.pop("_registry_cli_cleanup", None)
+            if cleanup is not None:
+                cleanup()
+        finally:
+            _drop_database(postgres_server, name)
 
 
 @pytest.fixture

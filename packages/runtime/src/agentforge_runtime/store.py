@@ -10,21 +10,19 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
-
 from agentforge_core.evaluation import evaluate_case
-
-from agentforge_runtime.contracts import AttemptLease, StepRecord
-from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_core.faults import (
+    NOOP_FAULT_INJECTOR,
     FaultInjector,
     FaultPoint,
     InjectedCrash,
-    NOOP_FAULT_INJECTOR,
 )
+
+from agentforge_runtime.contracts import AttemptLease, StepRecord
+from agentforge_runtime.errors import LeaseLostError, TaskNotRunningError
 from agentforge_runtime.recovery import validate_recovery_records
 
 CANCEL_REQUEST_EVENT = "task.cancel.requested"
@@ -1598,7 +1596,7 @@ class RuntimeStore:
         evidence_rows = await conn.fetch(
             """
             SELECT id::text AS evidence_id, task_id::text AS task_id,
-                   data_snapshot_id, query_plan_json
+                   data_snapshot_id, row_count, query_plan_json
             FROM harness.evidences WHERE task_id = $1::uuid
             ORDER BY created_at, id
             """,
@@ -1665,7 +1663,7 @@ class RuntimeStore:
                     summary_json = jsonb_build_object(
                         'total', $1::integer, 'passed', $2::integer,
                         'failed', $3::integer, 'pending', 0,
-                        'score', to_char($2::numeric / NULLIF($1, 0), '0.0000'))
+                        'score', to_char($2::numeric / NULLIF($1, 0), 'FM0.0000'))
                 WHERE id = $4::uuid AND status <> 'completed'
                 """,
                 total, passed, summary["failed"], case["run_id"],
